@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131b">
+  <title>Beat Saber VR Map Editor</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+  </script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><div class="brand-icon">▰</div><div><strong>VR MAP EDITOR</strong><small>BEAT SABER · NOTES ONLY</small></div></div>
+  <div class="toolbar">
+    <button id="undoBtn" title="Undo (Ctrl+Z)" disabled>↶ Undo</button>
+    <button id="redoBtn" title="Redo (Ctrl+Y)" disabled>↷ Redo</button>
+    <span class="toolbar-divider"></span>
+    <button id="saveProjectBtn">Save project</button>
+    <button id="loadProjectBtn">Load project</button>
+    <input id="projectFile" type="file" accept=".json,application/json" hidden>
+    <button id="exportBtn" class="primary">Export song ZIP</button>
+    <button id="vrButton" class="vr-button">Enter VR</button>
+  </div>
+</header>
+
+<main class="app-layout">
+  <section class="editor-column">
+    <div class="viewport-wrap">
+      <div id="viewport"></div>
+      <div class="view-label"><span class="live-dot"></span> 3D NOTE EDITOR</div>
+      <div class="viewport-help" id="viewportHelp">Desktop preview · VR controllers can place, select and move notes</div>
+      <div class="preview-chip" id="previewChip">INCOMING NOTE PREVIEW · 2.0s</div>
+      <div class="viewport-bottom"><span id="vrStatus">Desktop mode</span><span>Trigger: place/select · Grip: move · Stick: beat/column · Stick click: deselect · A/X: rotate · B/Y: color</span></div>
+    </div>
+    <section class="timeline-panel">
+      <div class="timeline-head">
+        <div><h2>Timeline</h2><span class="muted" id="timelineMeta">Click to seek · drag note markers to move them</span></div>
+        <div class="timeline-controls">
+          <label class="zoom-control">Zoom <input id="zoom" type="range" min="12" max="48" value="24"><span id="zoomValue">24 px/beat</span></label>
+          <button id="metronomeBtn" class="toggle-button">Metronome off</button>
+        </div>
+      </div>
+      <div class="timeline-scroll" id="timelineScroll"><canvas id="timelineCanvas" width="1000" height="220"></canvas></div>
+      <div class="timeline-foot"><span>12 lanes · 4 columns × 3 rows</span><span id="timelinePosition">Beat 0.000</span></div>
+    </section>
+  </section>
+
+  <aside class="sidepanel">
+    <section class="panel-section song-section">
+      <div class="section-heading"><h2>Song</h2><span class="status-pill" id="audioStatus">NO AUDIO</span></div>
+      <label class="import-button">Import audio from computer<input id="audioInput" type="file" accept="audio/*"></label>
+      <div class="file-name" id="audioName">No audio loaded</div>
+      <div class="transport-row"><button id="playBtn" class="primary">▶ Play</button><button id="stopBtn">■ Stop</button></div>
+      <div class="time-readout"><strong id="currentTime">0:00.000</strong><span id="totalTime">0:00</span></div>
+      <input id="audioSeek" class="seek" type="range" min="0" max="1000" value="0">
+    </section>
+
+    <section class="panel-section">
+      <h2>Song data</h2>
+      <label>Song title<input id="songTitle" value="Untitled Map"></label>
+      <label>Artist<input id="songArtist" value="Unknown Artist"></label>
+      <label>Mapper<input id="mapperName" value="Mapper"></label>
+      <div class="two-col">
+        <label>BPM<input id="bpm" type="number" min="1" max="1000" step="0.01" value="120"></label>
+        <label>Song offset (sec)<input id="songOffset" type="number" step="0.001" value="0"></label>
+      </div>
+      <p class="help-text">Offset adjusts the beat grid against the audio and is written to the map metadata.</p>
+    </section>
+
+    <section class="panel-section difficulty-section">
+      <div class="section-heading"><h2>Difficulties</h2><span class="count-pill" id="difficultyCount">5</span></div>
+      <div class="difficulty-grid" id="difficultyGrid">
+        <button data-difficulty="Easy">Easy</button><button data-difficulty="Normal">Normal</button>
+        <button data-difficulty="Hard">Hard</button><button data-difficulty="Expert" class="active">Expert</button>
+        <button data-difficulty="ExpertPlus">Expert+</button>
+      </div>
+      <div class="difficulty-actions"><button id="clearDifficultyBtn" class="subtle-button">Clear current</button><button id="copyDownBtn" class="subtle-button">Copy from lower</button></div>
+    </section>
+
+    <section class="panel-section note-section">
+      <div class="section-heading"><h2>Note tool</h2><span class="count-pill" id="noteCount">0 notes</span></div>
+      <div class="two-col">
+        <label>Color<select id="noteColor"><option value="0">Left saber / red</option><option value="1">Right saber / blue</option></select></label>
+        <label>Cut direction<select id="noteDirection">
+          <option value="0">Down</option><option value="1">Up</option><option value="2">Left</option><option value="3">Right</option>
+          <option value="4">Up-left</option><option value="5">Up-right</option><option value="6">Down-left</option><option value="7">Down-right</option><option value="8">Dot</option>
+        </select></label>
+      </div>
+      <div class="two-col">
+        <label>Column<select id="gridX"><option>0</option><option>1</option><option selected>2</option><option>3</option></select></label>
+        <label>Row<select id="gridY"><option>0</option><option selected>1</option><option>2</option></select></label>
+      </div>
+      <label>Beat snap<select id="snap"><option value="1">1/1 beat</option><option value="0.5" selected>1/2 beat</option><option value="0.25">1/4 beat</option><option value="0.125">1/8 beat</option><option value="0.0625">1/16 beat</option><option value="0">Off</option></select></label>
+      <div class="tool-grid"><button id="addNoteBtn" class="primary">＋ Add at playhead</button><button id="deleteNoteBtn">Delete selected</button><button id="rotateNoteBtn">Rotate direction</button><button id="duplicateNoteBtn">Duplicate note</button></div>
+      <div class="selected-note" id="selectedInfo">No note selected</div>
+      <div class="two-col inspector-fields">
+        <label>Selected beat<input id="selectedBeatInput" type="number" step="0.0625" disabled></label>
+        <label>Angle offset<input id="selectedAngleInput" type="number" min="-180" max="180" step="1" value="0" disabled></label>
+      </div>
+      <p class="help-text">Click a note marker in the timeline or a cube in the 3D grid to select it. Drag a timeline marker to change its beat and lane.</p>
+    </section>
+
+    <section class="panel-section map-section">
+      <div class="section-heading"><h2>Current difficulty</h2><span class="count-pill" id="selectedDifficultyLabel">Expert</span></div>
+      <div id="noteList" class="note-list"><div class="empty-list">No notes in this difficulty</div></div>
+    </section>
+    <div class="status-line" id="statusLine">Ready. Import a song to begin.</div>
+    <footer>Beat Saber v3 export · no lighting events · browser-side processing</footer>
+  </aside>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
