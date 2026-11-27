@@ -1,2769 +1,339 @@
-
-import * as THREE from "three";
-import { XRButton } from "three/addons/webxr/XRButton.js";
-
-// ------------------------------------------------------------
-// Beat Saber VR Map Editor
-// v3 note-only output. Audio stays local in the browser.
-// ------------------------------------------------------------
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { VRButton } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/webxr/VRButton.js";
 
 const $ = id => document.getElementById(id);
-const DIFFICULTIES = ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"];
-const RANKS = { Easy: 1, Normal: 3, Hard: 5, Expert: 7, ExpertPlus: 9 };
-const DIRECTIONS = ["↓", "↑", "←", "→", "↖", "↗", "↙", "↘", "•"];
-const DIR_ANGLES = { 0: Math.PI, 1: 0, 2: Math.PI / 2, 3: -Math.PI / 2, 4: Math.PI / 4, 5: -Math.PI / 4, 6: 3 * Math.PI / 4, 7: -3 * Math.PI / 4, 8: 0 };
-const GRID_SPACING = 0.46;
-const EDITOR_Z = -3.05;
-const PREVIEW_SECONDS = 2.15;
+const statusEl = $("status");
+const setStatus = message => statusEl.textContent = message;
 
-let levels = Object.fromEntries(DIFFICULTIES.map(name => [name, []]));
-let activeDifficulty = "Expert";
-let selectedId = null;
-let nextNoteId = 1;
-let undoStack = [];
-let redoStack = [];
-let audioFile = null;
-let audioURL = null;
-let audioElement = null;
-let audioDuration = 0;
-let manualBeat = 0;
-let metronomeEnabled = false;
-let metronomeContext = null;
-let lastMetronomeBeat = -1;
-let ffmpegInstance = null;
-let ffmpegLoadPromise = null;
-let timelineScale = 24;
-let lastTimelineDraw = -1000;
-let isTimelineDragging = false;
-let timelineDragId = null;
-let timelinePointerMoved = false;
-let vrDrag = null;
-let controllerObjects = [];
-let controllerButtonStates = new WeakMap();
-let statusTimer = null;
+const DIFFS = ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"];
+const RANKS = { Easy:1, Normal:3, Hard:5, Expert:7, ExpertPlus:9 };
+const DIRS = ["Up","Down","Left","Right","Up-Left","Up-Right","Down-Left","Down-Right","Dot"];
+const GRID_X = 4, GRID_Y = 3, CELL = 0.48;
+let activeDiff = "Expert";
+let levels = Object.fromEntries(DIFFS.map(d => [d, []]));
+let nextId = 1, selectedId = null, noteColor = 0, noteDirection = 0;
+let bpm = 120, offset = 0, snap = 0.25, songTitle = "Untitled Song", artist = "Unknown Artist", mapper = "Mapper";
+let audio = new Audio(), audioUrl = null, audioFile = null, audioDuration = 0;
+let isPlaying = false, manualBeat = 0, lastFrame = performance.now();
+let undoStack = [], redoStack = [];
 
-const viewport = $("viewport");
-const timelineCanvas = $("timelineCanvas");
-const timelineCtx = timelineCanvas.getContext("2d");
-const timelineScroll = $("timelineScroll");
-
-// Three.js scene. Scene lighting is only for the editor preview and is not exported.
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0d1119);
-const camera = new THREE.PerspectiveCamera(66, 1, 0.05, 100);
-camera.position.set(0, 1.58, 5.8);
-const renderer = new THREE.WebGLRenderer({
-  antialias: true,
-  alpha: false,
-  powerPreference: "high-performance"
-});
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.6));
-renderer.outputColorSpace = THREE.SRGBColorSpace;
+scene.background = new THREE.Color(0x080d18);
+const camera = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(0, 1.55, 4.8);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
-renderer.xr.setReferenceSpaceType("local-floor");
-viewport.appendChild(renderer.domElement);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer, { optionalFeatures:["local-floor","bounded-floor"] }));
+scene.add(new THREE.HemisphereLight(0xb9d4ff, 0x172036, 2.0));
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.2);
+keyLight.position.set(2, 5, 4); scene.add(keyLight);
 
-scene.add(new THREE.HemisphereLight(0xe3eaff, 0x323c52, 1.9));
-const keyLight = new THREE.DirectionalLight(0xffffff, 1.15);
-keyLight.position.set(2.5, 4, 4);
-scene.add(keyLight);
-
-const editorRoot = new THREE.Group();
-editorRoot.position.set(0, 1.57, EDITOR_Z);
-scene.add(editorRoot);
-const editNoteMeshes = new Map();
-const previewNoteMeshes = new Map();
-const cellMeshes = [];
+const world = new THREE.Group(); scene.add(world);
+const panelGroup = new THREE.Group(); scene.add(panelGroup);
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-const tempMatrix = new THREE.Matrix4();
-const editPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -EDITOR_Z);
+const controllers = [];
+const interactive = [];
+const noteMeshes = new Map();
+let dragNote = null;
+let currentPanel = "editor";
+let keyboardTarget = null;
+let keyboardValue = "";
 
-const panelBack = new THREE.Mesh(
-  new THREE.PlaneGeometry(2.72, 2.48),
-  new THREE.MeshBasicMaterial({
-    color: 0x121a28,
-    transparent: true,
-    opacity: 0.97,
-    side: THREE.DoubleSide
-  })
-);
-panelBack.position.z = -0.065;
-editorRoot.add(panelBack);
-
-const cellMaterial = new THREE.MeshBasicMaterial({
-  color: 0x3f526d,
-  transparent: true,
-  opacity: 0.23,
-  side: THREE.DoubleSide
-});
-const cellGeometry = new THREE.PlaneGeometry(0.43, 0.43);
-
-for (let y = 0; y < 3; y++) {
-  for (let x = 0; x < 4; x++) {
-    const cell = new THREE.Mesh(cellGeometry, cellMaterial.clone());
-    cell.position.set(
-      (x - 1.5) * GRID_SPACING,
-      (y - 1) * GRID_SPACING,
-      0
-    );
-    cell.userData = { kind: "cell", x, y };
-    editorRoot.add(cell);
-    cellMeshes.push(cell);
-  }
-}
-
-const lineMaterial = new THREE.LineBasicMaterial({
-  color: 0x52617a,
-  transparent: true,
-  opacity: 0.82
-});
-
-function addLine(a, b) {
-  const geometry = new THREE.BufferGeometry().setFromPoints([a, b]);
-  editorRoot.add(new THREE.Line(geometry, lineMaterial));
-}
-
-for (let x = 0; x <= 4; x++) {
-  const xx = (x - 2) * GRID_SPACING;
-  addLine(
-    new THREE.Vector3(xx, -1.5 * GRID_SPACING, 0.018),
-    new THREE.Vector3(xx, 1.5 * GRID_SPACING, 0.018)
-  );
-}
-
-for (let y = 0; y <= 3; y++) {
-  const yy = (y - 1.5) * GRID_SPACING;
-  addLine(
-    new THREE.Vector3(-2 * GRID_SPACING, yy, 0.018),
-    new THREE.Vector3(2 * GRID_SPACING, yy, 0.018)
-  );
-}
-
-// Small labels on the board make the 0..3 columns and 0..2 rows legible in VR.
-function addBoardLabel(text, x, y) {
-  const canvas = document.createElement("canvas");
-  canvas.width = 128;
-  canvas.height = 64;
-
-  const ctx = canvas.getContext("2d");
-  ctx.fillStyle = "#a6b4d1";
-  ctx.font = "28px sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, 64, 32);
-
-  const texture = new THREE.CanvasTexture(canvas);
-  const material = new THREE.MeshBasicMaterial({
-    map: texture,
-    transparent: true,
-    depthWrite: false
-  });
-
-  const mesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.14, 0.08),
-    material
-  );
-
-  mesh.position.set(x, y, 0.03);
-  editorRoot.add(mesh);
-}
-
-for (let x = 0; x < 4; x++) {
-  addBoardLabel(
-    String(x),
-    (x - 1.5) * GRID_SPACING,
-    -0.88
-  );
-}
-
-for (let y = 0; y < 3; y++) {
-  addBoardLabel(
-    String(y),
-    -1.24,
-    (y - 1) * GRID_SPACING
-  );
-}
-
-// VR-accessible difficulty and transport controls are part of the 3D board.
-const vrDifficultyTiles = new Map();
-let vrBeatTile = null;
-let vrPlayTile = null;
-let vrStopTile = null;
-
-function makeVrTile(text, width, height, x, y, kind, value = null) {
-  const canvas = document.createElement("canvas");
-  canvas.width = 512;
-  canvas.height = 160;
-
-  const context = canvas.getContext("2d");
-  const texture = new THREE.CanvasTexture(canvas);
-
-  const material = new THREE.MeshBasicMaterial({
-    map: texture,
-    transparent: true,
-    side: THREE.DoubleSide
-  });
-
-  const mesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(width, height),
-    material
-  );
-
-  mesh.position.set(x, y, 0.045);
-  mesh.userData = { kind, value, canvas, context, texture };
-
-  paintVrTile(mesh, text, false);
-  editorRoot.add(mesh);
-
+function roundedPanel(w,h,color=0x111b2d) {
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w,h), new THREE.MeshBasicMaterial({color, side:THREE.DoubleSide}));
   return mesh;
 }
-
-function paintVrTile(mesh, text, active = false, subdued = false) {
-  const ctx = mesh.userData.context;
-  const canvas = mesh.userData.canvas;
-
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  ctx.fillStyle = active
-    ? "#354576"
-    : subdued
-      ? "#182131"
-      : "#202b3e";
-
-  ctx.strokeStyle = active ? "#aabaff" : "#586985";
-  ctx.lineWidth = 5;
-
-  ctx.beginPath();
-
-  if (typeof ctx.roundRect === "function") {
-    ctx.roundRect(8, 8, canvas.width - 16, canvas.height - 16, 22);
-  } else {
-    ctx.rect(8, 8, canvas.width - 16, canvas.height - 16);
-  }
-
-  ctx.fill();
-  ctx.stroke();
-
-  ctx.fillStyle = active
-    ? "#ffffff"
-    : subdued
-      ? "#8794ad"
-      : "#d5ddec";
-
-  ctx.font = "bold 39px sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
-
-  mesh.userData.texture.needsUpdate = true;
+function canvasTexture(text, opts={}) {
+  const c = document.createElement("canvas"); c.width = opts.width || 512; c.height = opts.height || 128;
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.fillStyle = opts.bg || "#17243b"; ctx.fillRect(0,0,c.width,c.height);
+  ctx.fillStyle = opts.color || "#f0f4ff"; ctx.font = `${opts.weight || 700} ${opts.fontSize || 34}px system-ui`;
+  ctx.textAlign = opts.align || "center"; ctx.textBaseline = "middle";
+  ctx.fillText(String(text), c.width/2, c.height/2, c.width-24);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
 }
-
-DIFFICULTIES.forEach((name, index) => {
-  const x = (index - 2) * 0.5;
-
-  const tile = makeVrTile(
-    name === "ExpertPlus" ? "EXPERT+" : name.toUpperCase(),
-    0.46,
-    0.18,
-    x,
-    0.98,
-    "difficulty",
-    name
-  );
-
-  vrDifficultyTiles.set(name, tile);
-});
-
-vrPlayTile = makeVrTile(
-  "PLAY / PAUSE", 0.65, 0.17, -0.77, -1.09, "action", "playpause"
-);
-
-vrStopTile = makeVrTile(
-  "STOP", 0.42, 0.17, -0.13, -1.09, "action", "stop"
-);
-
-vrBeatTile = makeVrTile(
-  "BEAT 0.00", 0.80, 0.17, 0.74, -1.09, "readout", "beat"
-);
-
-function refreshVrControls() {
-  for (const [name, tile] of vrDifficultyTiles) {
-    const label = name === "ExpertPlus" ? "EXPERT+" : name.toUpperCase();
-    paintVrTile(tile, label, name === activeDifficulty);
-  }
-
-  if (vrPlayTile) {
-    paintVrTile(
-      vrPlayTile,
-      audioElement && !audioElement.paused ? "PAUSE" : "PLAY",
-      false
-    );
-  }
-
-  if (vrStopTile) paintVrTile(vrStopTile, "STOP", false);
+function label(text, x,y,z,w=1.2,h=.24, opts={}) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w,h), new THREE.MeshBasicMaterial({map:canvasTexture(text,opts),transparent:false}));
+  m.position.set(x,y,z); panelGroup.add(m); return m;
 }
-
-function updateVrBeatReadout() {
-  if (!vrBeatTile) return;
-
-  const value = `BEAT ${currentBeat().toFixed(2)}`;
-
-  if (vrBeatTile.userData.lastText !== value) {
-    vrBeatTile.userData.lastText = value;
-    paintVrTile(vrBeatTile, value, false, true);
-  }
-}
-
-refreshVrControls();
-
-const floor = new THREE.GridHelper(30, 60, 0x303b50, 0x1b2433);
-floor.position.y = 0;
-scene.add(floor);
-
-// ------------------------------------------------------------
-// Project and history
-// ------------------------------------------------------------
-
-function cloneLevels(source = levels) {
-  return JSON.parse(JSON.stringify(source));
-}
-
-function pushUndo() {
-  undoStack.push(cloneLevels());
-
-  if (undoStack.length > 80) undoStack.shift();
-
-  redoStack.length = 0;
-  updateHistoryButtons();
-}
-
-function updateHistoryButtons() {
-  $("undoBtn").disabled = undoStack.length === 0;
-  $("redoBtn").disabled = redoStack.length === 0;
-}
-
-function undo() {
-  if (!undoStack.length) return;
-
-  redoStack.push(cloneLevels());
-  levels = undoStack.pop();
-  selectedId = null;
-
-  rebuildAllViews();
-  updateHistoryButtons();
-  setStatus("Undo complete.");
-}
-
-function redo() {
-  if (!redoStack.length) return;
-
-  undoStack.push(cloneLevels());
-  levels = redoStack.pop();
-  selectedId = null;
-
-  rebuildAllViews();
-  updateHistoryButtons();
-  setStatus("Redo complete.");
-}
-
-function currentNotes() {
-  return levels[activeDifficulty];
-}
-
-function selectedNote() {
-  return currentNotes().find(note => note.id === selectedId) || null;
-}
-
-function bpm() {
-  return Math.max(1, Number($("bpm").value) || 120);
-}
-
-function offsetSeconds() {
-  return Number($("songOffset").value) || 0;
-}
-
-function snapBeat(beat) {
-  const step = Number($("snap").value);
-
-  if (!step) return Math.max(0, beat);
-
-  return Math.max(0, Math.round(beat / step) * step);
-}
-
-function currentTimeSeconds() {
-  if (audioElement) return audioElement.currentTime || 0;
-
-  return manualBeat * 60 / bpm() + offsetSeconds();
-}
-
-function currentBeat() {
-  return Math.max(
-    0,
-    (currentTimeSeconds() - offsetSeconds()) * bpm() / 60
-  );
-}
-
-function seekToBeat(beat, scrollIntoView = false) {
-  const safeBeat = Math.max(0, Number(beat) || 0);
-  manualBeat = safeBeat;
-
-  if (audioElement) {
-    const target = Math.max(
-      0,
-      safeBeat * 60 / bpm() + offsetSeconds()
-    );
-
-    audioElement.currentTime = Math.min(
-      audioDuration || target,
-      target
-    );
-  }
-
-  updateTransportReadout();
-  drawTimeline(true);
-
-  if (scrollIntoView) {
-    const x = safeBeat * timelineScale;
-    const pad = timelineScroll.clientWidth * 0.35;
-
-    timelineScroll.scrollLeft = Math.max(0, x - pad);
-  }
-}
-
-function setStatus(message, kind = "normal", timeout = 4800) {
-  const line = $("statusLine");
-
-  line.textContent = message;
-  line.className = "status-line" +
-    (kind === "error" ? " error" : kind === "success" ? " success" : "");
-
-  clearTimeout(statusTimer);
-
-  if (timeout > 0) {
-    statusTimer = setTimeout(() => {
-      line.className = "status-line";
-    }, timeout);
-  }
-}
-
-// ------------------------------------------------------------
-// Difficulty switching
-// ------------------------------------------------------------
-
-function switchDifficulty(name) {
-  if (!levels[name]) return;
-
-  activeDifficulty = name;
-  selectedId = null;
-
-  document.querySelectorAll("#difficultyGrid button").forEach(button => {
-    button.classList.toggle(
-      "active",
-      button.dataset.difficulty === name
-    );
-  });
-
-  $("selectedDifficultyLabel").textContent =
-    name === "ExpertPlus" ? "Expert+" : name;
-
-  rebuildAllViews();
-  refreshVrControls();
-
-  setStatus(
-    `Editing ${name === "ExpertPlus" ? "Expert+" : name}.`
-  );
-}
-
-// ------------------------------------------------------------
-// Note meshes and editor view
-// ------------------------------------------------------------
-
-function directionRotation(direction, angle = 0) {
-  return (DIR_ANGLES[direction] ?? 0) +
-    (Number(angle) || 0) * Math.PI / 180;
-}
-
-function createNoteMesh(note, preview = false) {
-  const group = new THREE.Group();
-
-  const color = note.c === 0 ? 0xff465f : 0x469cff;
-
-  const bodyMat = new THREE.MeshStandardMaterial({
-    color,
-    emissive: color,
-    emissiveIntensity: preview ? 0.12 : 0.2,
-    roughness: 0.35,
-    metalness: 0.08
-  });
-
-  const body = new THREE.Mesh(
-    new THREE.BoxGeometry(0.30, 0.30, 0.09),
-    bodyMat
-  );
-
-  group.add(body);
-
-  const arrow = new THREE.Mesh(
-    new THREE.ConeGeometry(0.075, 0.15, 3),
-    new THREE.MeshBasicMaterial({ color: 0xffffff })
-  );
-
-  arrow.rotation.z = directionRotation(note.d, note.a);
-  arrow.position.z = 0.065;
-
-  group.add(arrow);
-
-  group.position.set(
-    (note.x - 1.5) * GRID_SPACING,
-    (note.y - 1) * GRID_SPACING,
-    preview ? -1 : 0.09
-  );
-
-  group.userData = {
-    kind: preview ? "preview" : "note",
-    id: note.id
-  };
-
-  editorRoot.add(group);
-
+function button(text,x,y,z,action,opts={}) {
+  const group = new THREE.Group(); group.position.set(x,y,z);
+  const bg = new THREE.Mesh(new THREE.PlaneGeometry(opts.w || 1.05, opts.h || .32), new THREE.MeshBasicMaterial({color:opts.color || 0x263a5c, side:THREE.DoubleSide}));
+  const tx = new THREE.Mesh(new THREE.PlaneGeometry((opts.w || 1.05)-.05,(opts.h || .32)-.05), new THREE.MeshBasicMaterial({map:canvasTexture(text,{bg:"#263a5c",fontSize:opts.fontSize || 27}),side:THREE.DoubleSide}));
+  tx.position.z = .006; group.add(bg,tx); panelGroup.add(group);
+  bg.userData.action = action; bg.userData.kind = "button"; interactive.push(bg);
+  tx.userData.action = action; tx.userData.kind = "button"; interactive.push(tx);
   return group;
 }
+function clearPanel() {
+  for (const child of [...panelGroup.children]) {
+    panelGroup.remove(child);
+    child.traverse(o => { if(o.geometry)o.geometry.dispose(); if(o.material){ if(o.material.map)o.material.map.dispose(); o.material.dispose(); }});
+  }
+  interactive.splice(0, interactive.length);
+}
+function makePanel(title, subtitle="") {
+  clearPanel();
+  const bg = roundedPanel(3.0,2.0,0x101a2b); bg.position.set(0,1.55,-1.45); panelGroup.add(bg);
+  label(title,0,2.36,-1.43,2.7,.25,{bg:"#101a2b",fontSize:34});
+  if(subtitle) label(subtitle,0,2.12,-1.43,2.7,.17,{bg:"#101a2b",fontSize:19,color:"#9fb1d1",weight:500});
+}
+function currentNotes(){ return levels[activeDiff]; }
+function beatNow() {
+  if (isPlaying && audio && !audio.paused) return Math.max(0,(audio.currentTime-offset)*bpm/60);
+  return Math.max(0,manualBeat);
+}
+function pushUndo() {
+  undoStack.push(JSON.stringify({levels,activeDiff,nextId,selectedId}));
+  if(undoStack.length>80) undoStack.shift();
+  redoStack.length=0;
+}
+function restoreState(s) {
+  const d=JSON.parse(s); levels=d.levels; activeDiff=d.activeDiff; nextId=d.nextId; selectedId=d.selectedId;
+  rebuildNotes(); showEditor();
+}
+function undo(){ if(!undoStack.length)return; redoStack.push(JSON.stringify({levels,activeDiff,nextId,selectedId})); restoreState(undoStack.pop()); setStatus("Undo."); }
+function redo(){ if(!redoStack.length)return; undoStack.push(JSON.stringify({levels,activeDiff,nextId,selectedId})); restoreState(redoStack.pop()); setStatus("Redo."); }
 
-function disposeObject(object) {
-  object.traverse(child => {
-    if (child.geometry) child.geometry.dispose();
+function createTextSprite(text,color="#ffffff") {
+  const c=document.createElement("canvas"); c.width=256;c.height=128;
+  const ctx=c.getContext("2d");ctx.clearRect(0,0,256,128);
+  ctx.fillStyle=color;ctx.font="bold 78px system-ui";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(text,128,64);
+  const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;
+  return new THREE.Mesh(new THREE.PlaneGeometry(.2,.2),new THREE.MeshBasicMaterial({map:tex,transparent:true,depthWrite:false}));
+}
+function noteObject(n) {
+  const g=new THREE.Group();
+  const color=n.c===0?0xff465f:0x459bff;
+  const body=new THREE.Mesh(new THREE.BoxGeometry(.31,.31,.09),new THREE.MeshStandardMaterial({color,emissive:color,emissiveIntensity:.18,roughness:.4}));
+  g.add(body);
+  const arrow=createTextSprite(["↑","↓","←","→","↖","↗","↙","↘","•"][n.d] || "↑");
+  arrow.position.z=.055; arrow.scale.set(1.1,1.1,1); g.add(arrow);
+  g.position.set((n.x-1.5)*CELL,(n.y-1)*CELL,-.08);
+  g.userData.noteId=n.id; world.add(g); noteMeshes.set(n.id,g); return g;
+}
+function rebuildNotes(){
+  for(const obj of noteMeshes.values()){world.remove(obj);obj.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material){if(o.material.map)o.material.map.dispose();o.material.dispose();}});}
+  noteMeshes.clear(); currentNotes().forEach(noteObject); updateSelection();
+}
+function updateSelection(){
+  for(const [id,g] of noteMeshes){const chosen=id===selectedId;g.scale.setScalar(chosen?1.16:1);g.children[0].material.emissiveIntensity=chosen?.8:.18;}
+}
+function selectNote(id){selectedId=id;updateSelection();showEditor();}
+function addNote(x,y,beat=beatNow()){
+  const b=Math.max(0,Math.round(beat/snap)*snap);
+  if(currentNotes().some(n=>n.b===b&&n.x===x&&n.y===y)){setStatus("That cell already has a note at this beat.");return;}
+  pushUndo();const n={id:nextId++,b:Number(b.toFixed(4)),x,y,c:noteColor,d:noteDirection,a:0};
+  currentNotes().push(n);noteObject(n);selectedId=n.id;updateSelection();showEditor();setStatus(`Placed ${n.c===0?"red":"blue"} note at beat ${n.b.toFixed(2)}.`);
+}
+function deleteSelected(){
+  if(selectedId==null)return;pushUndo();levels[activeDiff]=currentNotes().filter(n=>n.id!==selectedId);
+  selectedId=null;rebuildNotes();showEditor();setStatus("Note deleted.");
+}
+function duplicateSelected(){
+  const n=currentNotes().find(n=>n.id===selectedId);if(!n)return;pushUndo();
+  const copy={...n,id:nextId++,b:Number((n.b+snap).toFixed(4))};currentNotes().push(copy);selectedId=copy.id;rebuildNotes();showEditor();
+}
+function rotateSelected(){
+  const n=currentNotes().find(n=>n.id===selectedId);if(!n)return;pushUndo();n.d=(n.d+1)%9;rebuildNotes();showEditor();
+}
+function changeSelectedColor(){
+  const n=currentNotes().find(n=>n.id===selectedId);if(!n)return;pushUndo();n.c=1-n.c;rebuildNotes();showEditor();
+}
 
-    if (child.material) {
-      if (Array.isArray(child.material)) {
-        child.material.forEach(material => material.dispose());
-      } else {
-        child.material.dispose();
-      }
-    }
+function addGrid(){
+  const grid=new THREE.Group();world.add(grid);
+  const board=new THREE.Mesh(new THREE.PlaneGeometry(2.25,1.75),new THREE.MeshBasicMaterial({color:0x0e1727,side:THREE.DoubleSide}));
+  board.position.set(0,0,-.18);grid.add(board);
+  for(let x=0;x<4;x++)for(let y=0;y<3;y++){
+    const cell=new THREE.Mesh(new THREE.PlaneGeometry(.43,.43),new THREE.MeshBasicMaterial({color:0x1d2a40,side:THREE.DoubleSide}));
+    cell.position.set((x-1.5)*CELL,(y-1)*CELL,-.12);cell.userData={kind:"cell",x,y};grid.add(cell);interactive.push(cell);
+    const border=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(.43,.43)),new THREE.LineBasicMaterial({color:0x50617e}));
+    border.position.copy(cell.position);border.position.z-=.002;grid.add(border);
+  }
+  label("NOTE GRID",0,1.05,-.1,1.5,.18,{bg:"#080d18",fontSize:20});
+}
+addGrid();
+
+function showEditor(){
+  currentPanel="editor";makePanel("NOTE EDITOR",`${activeDiff==="ExpertPlus"?"Expert+":activeDiff}  •  Beat ${beatNow().toFixed(2)}  •  ${currentNotes().length} notes`);
+  button("SONG",-1.0,1.78,-1.42,showSong,{w:.75});
+  button("DIFFICULTY",0,1.78,-1.42,showDifficulty,{w:1.05});
+  button("TOOLS",1.0,1.78,-1.42,showTools,{w:.75});
+  button("PLAY / PAUSE",-1.0,1.28,-1.42,togglePlay,{w:1.1});
+  button("BEAT -",-0.05,1.28,-1.42,()=>seekBeat(-snap),{w:.65});
+  button("BEAT +",.75,1.28,-1.42,()=>seekBeat(snap),{w:.65});
+  button("RED / BLUE",-1.0,.78,-1.42,()=>{noteColor=1-noteColor;showEditor();setStatus(`New notes: ${noteColor===0?"red":"blue"}.`);},{w:1.1});
+  button("DIRECTION",.05,.78,-1.42,()=>{noteDirection=(noteDirection+1)%9;showEditor();setStatus(`New direction: ${DIRS[noteDirection]}.`);},{w:1.0});
+  button("SNAP",1.0,.78,-1.42,cycleSnap,{w:.65});
+  const selected=currentNotes().find(n=>n.id===selectedId);
+  label(selected?`Selected  ${selected.c===0?"RED":"BLUE"}  ${DIRS[selected.d]}  beat ${selected.b.toFixed(2)}`:"Point at a grid cell and press trigger to place a note",0,.25,-1.42,2.65,.18,{bg:"#101a2b",fontSize:19,color:"#c6d4ee",weight:500});
+  button("DELETE",-.95,-.25,-1.42,deleteSelected,{w:.75,color:0x673144});
+  button("DUPLICATE",0,-.25,-1.42,duplicateSelected,{w:.95});
+  button("ROTATE",.95,-.25,-1.42,rotateSelected,{w:.75});
+  button("UNDO",-.65,-.72,-1.42,undo,{w:.75});
+  button("REDO",.25,-.72,-1.42,redo,{w:.75});
+  button("EXPORT",-1.0,-1.12,-1.42,showExport,{w:.85,color:0x315b55});
+  button("SAVE PROJECT",.15,-1.12,-1.42,saveProject,{w:1.25});
+  button("LOAD PROJECT",1.1,-1.12,-1.42,()=> $("projectPicker").click(),{w:1.15});
+  updateSelection();
+}
+function cycleSnap(){const vals=[1,.5,.25,.125,.0625];snap=vals[(vals.indexOf(snap)+1)%vals.length];showEditor();setStatus(`Snap is ${snap} beat.`);}
+function seekBeat(delta){manualBeat=Math.max(0,beatNow()+delta);if(audio&&!audio.paused)audio.currentTime=Math.max(0,manualBeat*60/bpm+offset);showEditor();}
+function togglePlay(){if(!audioFile){setStatus("Import a song in the Song panel first.");showSong();return;}if(audio.paused){audio.play().then(()=>{isPlaying=true;setStatus("Playing song.");}).catch(e=>setStatus("Playback failed: "+e.message));}else{audio.pause();isPlaying=false;setStatus("Paused.");}}
+function showSong(){
+  currentPanel="song";makePanel("SONG SETUP","Import and configure the audio entirely from the headset");
+  button("IMPORT AUDIO FILE",0,1.68,-1.42,()=> $("audioPicker").click(),{w:2.1,h:.4,color:0x315b55});
+  label(audioFile?audioFile.name:"No audio selected",0,1.27,-1.42,2.65,.18,{bg:"#101a2b",fontSize:18,color:"#c6d4ee",weight:500});
+  button("TITLE  - / +",-.75,.82,-1.42,()=>editText("title"),{w:1.25});
+  button("ARTIST",.75,.82,-1.42,()=>editText("artist"),{w:1.0});
+  label(songTitle,0,.48,-1.42,2.4,.18,{bg:"#101a2b",fontSize:20});
+  label(artist,0,.25,-1.42,2.4,.18,{bg:"#101a2b",fontSize:18,color:"#aebdd7",weight:500});
+  button("MAPPER",0,-.02,-1.42,()=>editText("mapper"),{w:1.0});
+  button("BPM -",-.8,-.2,-1.42,()=>{bpm=Math.max(1,bpm-1);showSong();},{w:.7});
+  button(`BPM ${bpm}` ,0,-.2,-1.42,()=>{bpm=Math.max(1,bpm+1);showSong();},{w:.8});
+  button("BPM +",.8,-.2,-1.42,()=>{bpm+=1;showSong();},{w:.7});
+  button("OFFSET -",-.8,-.65,-1.42,()=>{offset-=.01;showSong();},{w:.9});
+  button(`OFFSET ${offset.toFixed(2)}s`,0,-.65,-1.42,()=>{offset+=.01;showSong();},{w:1.0});
+  button("OFFSET +",.8,-.65,-1.42,()=>{offset+=.01;showSong();},{w:.9});
+  button("BACK TO EDITOR",0,-1.12,-1.42,showEditor,{w:1.6});
+}
+function editText(which){
+  keyboardTarget=which;
+  keyboardValue=which==="title"?songTitle:which==="artist"?artist:mapper;
+  showKeyboard();
+}
+function showKeyboard(){
+  currentPanel="keyboard";
+  makePanel("VIRTUAL KEYBOARD",`Editing ${keyboardTarget}. Select keys with your controller`);
+  label(keyboardValue || " ",0,1.72,-1.42,2.65,.24,{bg:"#101a2b",fontSize:25});
+  const rows=["1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM"];
+  rows.forEach((row,r)=>{
+    const chars=row.split("");
+    const start=-(chars.length-1)*.135;
+    chars.forEach((ch,i)=>button(ch,start+i*.27,1.18-r*.36,-1.42,()=>{if(keyboardValue.length<32)keyboardValue+=ch;showKeyboard();},{w:.23,h:.25,fontSize:19}));
   });
+  button("SPACE",-0.68,-.42,-1.42,()=>{if(keyboardValue.length<32)keyboardValue+=" ";showKeyboard();},{w:.75});
+  button("BACKSPACE",.25,-.42,-1.42,()=>{keyboardValue=keyboardValue.slice(0,-1);showKeyboard();},{w:1.05});
+  button("CANCEL",-.55,-.9,-1.42,()=>{keyboardTarget=null;showSong();},{w:.85,color:0x673144});
+  button("DONE",.55,-.9,-1.42,()=>{if(keyboardTarget==="title")songTitle=keyboardValue;else if(keyboardTarget==="artist")artist=keyboardValue;else mapper=keyboardValue;keyboardTarget=null;showSong();},{w:.85,color:0x315b55});
+}
+function showDifficulty(){
+  currentPanel="difficulty";makePanel("DIFFICULTIES","Select a difficulty to edit");
+  DIFFS.forEach((d,i)=>button(d==="ExpertPlus"?"EXPERT +":d,0,1.55-i*.43,-1.42,()=>{activeDiff=d;selectedId=null;rebuildNotes();showEditor();setStatus(`Editing ${d}.`);},{w:1.8,color:d===activeDiff?0x315b55:0x263a5c}));
+  button("COPY FROM LOWER",0,-.72,-1.42,()=>{const i=DIFFS.indexOf(activeDiff);if(i===0)return setStatus("Easy has no lower difficulty.");pushUndo();levels[activeDiff]=levels[DIFFS[i-1]].map(n=>({...n,id:nextId++}));selectedId=null;rebuildNotes();showEditor();},{w:1.8});
+  button("BACK",0,-1.12,-1.42,showEditor,{w:1.1});
+}
+function showTools(){
+  currentPanel="tools";makePanel("MAPPING TOOLS","Controller shortcuts and note settings");
+  button("NEW NOTE RED / BLUE",0,1.62,-1.42,()=>{noteColor=1-noteColor;showTools();},{w:2.0});
+  button("CYCLE CUT DIRECTION",0,1.12,-1.42,()=>{noteDirection=(noteDirection+1)%9;showTools();},{w:2.0});
+  button("ROTATE SELECTED",0,.62,-1.42,rotateSelected,{w:1.8});
+  button("DUPLICATE SELECTED",0,.12,-1.42,duplicateSelected,{w:1.8});
+  button("DELETE SELECTED",0,-.38,-1.42,deleteSelected,{w:1.8,color:0x673144});
+  button("CLEAR DIFFICULTY",0,-.78,-1.42,showClearConfirm,{w:1.8,color:0x673144});
+  button("BACK",0,-1.15,-1.42,showEditor,{w:1.0});
+}
+function showClearConfirm(){
+  currentPanel="clear-confirm";makePanel("CLEAR DIFFICULTY?","This removes every note in the selected difficulty");
+  button("YES, DELETE ALL",-.65,.35,-1.42,()=>{pushUndo();levels[activeDiff]=[];selectedId=null;rebuildNotes();showEditor();setStatus("Difficulty cleared.");},{w:1.35,color:0x673144});
+  button("CANCEL",.7,.35,-1.42,showTools,{w:1.0});
+}
+function showExport(){
+  currentPanel="export";makePanel("EXPORT BEATMAP","Create a Beat Saber song folder ZIP");
+  label("Exports Info.dat and all five Standard difficulties.",0,1.62,-1.42,2.65,.2,{bg:"#101a2b",fontSize:18,color:"#c6d4ee",weight:500});
+  label("Audio must be OGG Vorbis for Beat Saber.",0,1.32,-1.42,2.65,.2,{bg:"#101a2b",fontSize:17,color:"#ffcf85",weight:500});
+  button("EXPORT ZIP",0,.72,-1.42,exportZip,{w:1.8,h:.42,color:0x315b55});
+  button("BACK",0,-1.12,-1.42,showEditor,{w:1.0});
+}
+function saveProject(){
+  const data={format:"quest-vr-beatmap-project",version:1,metadata:{title:songTitle,artist,mapper,bpm,offset},levels};
+  download(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}),`${slug(songTitle)}.bsmapproject.json`);
+  setStatus("Project downloaded. Audio is not embedded, so keep the original audio file.");
+}
+function loadProjectFile(file){
+  const reader=new FileReader();reader.onload=()=>{try{const p=JSON.parse(reader.result);if(p.format!=="quest-vr-beatmap-project")throw Error("Not a Quest VR project.");levels=p.levels;for(const d of DIFFS)levels[d]=Array.isArray(levels[d])?levels[d]:[];songTitle=p.metadata?.title||"Untitled Song";artist=p.metadata?.artist||"Unknown Artist";bpm=p.metadata?.bpm||120;offset=p.metadata?.offset||0;nextId=Math.max(0,...Object.values(levels).flat().map(n=>n.id))+1;selectedId=null;rebuildNotes();showEditor();setStatus("Project loaded.");}catch(e){setStatus("Could not load project: "+e.message);}};reader.readAsText(file);
+}
+function download(blob,name){const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),5000);}
+function slug(s){return String(s||"beatmap").toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"")||"beatmap";}
+function makeInfo(){
+ return {_version:"2.1.0",_songName:songTitle,_songSubName:"",_songAuthorName:artist,_levelAuthorName:mapper,_beatsPerMinute:bpm,_songTimeOffset:offset,_shuffle:0,_shufflePeriod:0,_previewStartTime:0,_previewDuration:10,_songFilename:"song.ogg",_coverImageFilename:"",_environmentName:"DefaultEnvironment",_allDirectionsEnvironmentName:"GlassDesertEnvironment",_difficultyBeatmapSets:[{_beatmapCharacteristicName:"Standard",_difficultyBeatmaps:DIFFS.map(d=>({_difficulty:d,_difficultyRank:RANKS[d],_beatmapFilename:`${d}Standard.dat`,_noteJumpMovementSpeed:d==="ExpertPlus"?16:d==="Expert"?14:10,_noteJumpStartBeatOffset:0}))}]};
+}
+function makeBeatmap(notes){
+ return {version:"3.3.0",bpmEvents:[],rotationEvents:[],colorNotes:notes.map(n=>({b:n.b,x:n.x,y:n.y,c:n.c,d:n.d,a:n.a||0})).sort((a,b)=>a.b-b.b),bombNotes:[],obstacles:[],sliders:[],burstSliders:[],basicBeatmapEvents:[],colorBoostBeatmapEvents:[],waypoints:[],basicEventTypesWithKeywords:{d:[]},lightColorEventBoxGroups:[],lightRotationEventBoxGroups:[],lightTranslationEventBoxGroups:[],vfxEventBoxGroups:[],useNormalEventsAsCompatibleEvents:false};
+}
+// Minimal ZIP writer using uncompressed entries. This avoids a third-party ZIP dependency.
+const crcTable=(()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=(c&1)?0xedb88320^(c>>>1):c>>>1;t[n]=c>>>0;}return t;})();
+function crc32(bytes){let c=0xffffffff;for(const b of bytes)c=crcTable[(c^b)&255]^(c>>>8);return(c^0xffffffff)>>>0;}
+function zipStore(entries){
+ const enc=new TextEncoder(),local=[],central=[];let offset=0;
+ for(const e of entries){const name=enc.encode(e.name),data=typeof e.data==="string"?enc.encode(e.data):e.data,crc=crc32(data);
+  const l=new Uint8Array(30+name.length),v=new DataView(l.buffer);v.setUint32(0,0x04034b50,true);v.setUint16(4,20,true);v.setUint16(6,0x800,true);v.setUint16(8,0,true);v.setUint16(10,0,true);v.setUint16(12,0x21,true);v.setUint32(14,crc,true);v.setUint32(18,data.length,true);v.setUint32(22,data.length,true);v.setUint16(26,name.length,true);l.set(name,30);local.push(l,data);
+  const c=new Uint8Array(46+name.length),w=new DataView(c.buffer);w.setUint32(0,0x02014b50,true);w.setUint16(4,20,true);w.setUint16(6,20,true);w.setUint16(8,0x800,true);w.setUint16(10,0,true);w.setUint16(12,0,true);w.setUint16(14,0x21,true);w.setUint32(16,crc,true);w.setUint32(20,data.length,true);w.setUint32(24,data.length,true);w.setUint16(28,name.length,true);w.setUint32(42,offset,true);c.set(name,46);central.push(c);offset+=l.length+data.length;
+ }
+ const join=parts=>{const out=new Uint8Array(parts.reduce((s,p)=>s+p.length,0));let i=0;for(const p of parts){out.set(p,i);i+=p.length;}return out;};
+ const cd=join(central),end=new Uint8Array(22),v=new DataView(end.buffer);v.setUint32(0,0x06054b50,true);v.setUint16(8,entries.length,true);v.setUint16(10,entries.length,true);v.setUint32(12,cd.length,true);v.setUint32(16,offset,true);return join([...local,cd,end]);
+}
+async function exportZip(){
+ if(!audioFile){setStatus("Import audio first.");return;}
+ let audioBytes=new Uint8Array(await audioFile.arrayBuffer());
+ const sig=new TextDecoder().decode(audioBytes.slice(0,4));
+ if(sig!=="OggS"){setStatus("This audio is not OGG Vorbis. Please import an .ogg file for Beat Saber export. MP3/WAV can be previewed but cannot be packaged directly.");return;}
+ const entries=[{name:"Info.dat",data:JSON.stringify(makeInfo(),null,2)}];
+ for(const d of DIFFS)entries.push({name:`${d}Standard.dat`,data:JSON.stringify(makeBeatmap(levels[d]),null,2)});
+ entries.push({name:"song.ogg",data:audioBytes});
+ const zip=zipStore(entries);download(new Blob([zip],{type:"application/zip"}),`${slug(songTitle)}.zip`);setStatus("Beat Saber ZIP exported. Check the Quest Browser downloads.");
 }
 
-function clearMeshMap(map) {
-  for (const object of map.values()) {
-    editorRoot.remove(object);
-    disposeObject(object);
-  }
-
-  map.clear();
-}
-
-function rebuildNoteMeshes() {
-  clearMeshMap(editNoteMeshes);
-  clearMeshMap(previewNoteMeshes);
-
-  for (const note of currentNotes()) {
-    editNoteMeshes.set(
-      note.id,
-      createNoteMesh(note, false)
-    );
-  }
-
-  updateSelectionVisuals();
-}
-
-function updateSelectionVisuals() {
-  for (const [id, object] of editNoteMeshes) {
-    const selected = id === selectedId;
-    const material = object.children[0].material;
-
-    material.emissiveIntensity = selected ? 0.85 : 0.2;
-    object.scale.setScalar(selected ? 1.12 : 1);
-  }
-}
-
-function selectNote(id) {
-  if (
-    id != null &&
-    !currentNotes().some(note => note.id === id)
-  ) return;
-
-  selectedId = id;
-
-  updateSelectionVisuals();
-  updateInspector();
-  renderNoteList();
-  drawTimeline(true);
-}
-
-function addNoteAt(x, y, beat = currentBeat()) {
-  const targetBeat = snapBeat(beat);
-
-  const collision = currentNotes().find(note =>
-    note.b === targetBeat &&
-    note.x === x &&
-    note.y === y
-  );
-
-  if (collision) {
-    selectNote(collision.id);
-    setStatus("There is already a note in that cell at that beat.");
-    return collision;
-  }
-
-  pushUndo();
-
-  const note = {
-    id: nextNoteId++,
-    b: Number(targetBeat.toFixed(4)),
-    x,
-    y,
-    c: Number($("noteColor").value),
-    d: Number($("noteDirection").value),
-    a: 0
-  };
-
-  currentNotes().push(note);
-
-  editNoteMeshes.set(
-    note.id,
-    createNoteMesh(note, false)
-  );
-
-  selectNote(note.id);
-  refreshCounts();
-  drawTimeline(true);
-
-  setStatus(
-    `Added ${note.c === 0 ? "red" : "blue"} note at beat ${note.b.toFixed(3)}.`,
-    "success"
-  );
-
-  return note;
-}
-
-function updateNote(id, patch, history = true) {
-  const note = currentNotes().find(item => item.id === id);
-
-  if (!note) return;
-
-  if (history) pushUndo();
-
-  Object.assign(note, patch);
-
-  const object = editNoteMeshes.get(id);
-
-  if (object) {
-    object.position.set(
-      (note.x - 1.5) * GRID_SPACING,
-      (note.y - 1) * GRID_SPACING,
-      0.09
-    );
-
-    object.children[0].material.color.set(
-      note.c === 0 ? 0xff465f : 0x469cff
-    );
-
-    object.children[0].material.emissive.set(
-      note.c === 0 ? 0xff465f : 0x469cff
-    );
-
-    object.children[1].rotation.z =
-      directionRotation(note.d, note.a);
-  }
-
-  updateSelectionVisuals();
-  updateInspector();
-  renderNoteList();
-  refreshCounts();
-  drawTimeline(true);
-}
-
-function deleteSelected() {
-  const note = selectedNote();
-
-  if (!note) return;
-
-  pushUndo();
-
-  const object = editNoteMeshes.get(note.id);
-
-  if (object) {
-    editorRoot.remove(object);
-    disposeObject(object);
-    editNoteMeshes.delete(note.id);
-  }
-
-  const previewObject = previewNoteMeshes.get(note.id);
-
-  if (previewObject) {
-    editorRoot.remove(previewObject);
-    disposeObject(previewObject);
-    previewNoteMeshes.delete(note.id);
-  }
-
-  levels[activeDifficulty] = currentNotes().filter(
-    item => item.id !== note.id
-  );
-
-  selectedId = null;
-
-  updateInspector();
-  renderNoteList();
-  refreshCounts();
-  drawTimeline(true);
-
-  setStatus("Selected note deleted.");
-}
-
-function rotateSelected() {
-  const note = selectedNote();
-
-  if (!note) return;
-
-  updateNote(note.id, {
-    d: (note.d + 1) % 9
-  });
-}
-
-function duplicateSelected() {
-  const note = selectedNote();
-
-  if (!note) return;
-
-  const step = Number($("snap").value) || 0.25;
-  const beat = Number((note.b + step).toFixed(4));
-
-  if (currentNotes().some(other =>
-    other.b === beat &&
-    other.x === note.x &&
-    other.y === note.y
-  )) {
-    setStatus(
-      "Cannot duplicate there. That grid cell already contains a note at that beat."
-    );
-    return;
-  }
-
-  pushUndo();
-
-  const copy = {
-    ...note,
-    id: nextNoteId++,
-    b: beat
-  };
-
-  currentNotes().push(copy);
-
-  editNoteMeshes.set(
-    copy.id,
-    createNoteMesh(copy, false)
-  );
-
-  selectNote(copy.id);
-  refreshCounts();
-  drawTimeline(true);
-}
-
-function clearCurrentDifficulty() {
-  if (!currentNotes().length) return;
-
-  pushUndo();
-
-  levels[activeDifficulty] = [];
-  selectedId = null;
-
-  rebuildAllViews();
-
-  setStatus(`${activeDifficulty} difficulty cleared.`);
-}
-
-function copyFromLowerDifficulty() {
-  const index = DIFFICULTIES.indexOf(activeDifficulty);
-
-  if (index <= 0) {
-    setStatus("Easy is the lowest difficulty.");
-    return;
-  }
-
-  const sourceName = DIFFICULTIES[index - 1];
-
-  pushUndo();
-
-  levels[activeDifficulty] = levels[sourceName].map(note => ({
-    ...note,
-    id: nextNoteId++
-  }));
-
-  selectedId = null;
-
-  rebuildAllViews();
-
-  setStatus(
-    `Copied ${sourceName} notes into ${activeDifficulty}.`,
-    "success"
-  );
-}
-
-function rebuildAllViews() {
-  rebuildNoteMeshes();
-  updateInspector();
-  renderNoteList();
-  refreshCounts();
-  refreshDifficultyCount();
-  refreshVrControls();
-  drawTimeline(true);
-  updateHistoryButtons();
-}
-
-// ------------------------------------------------------------
-// Timeline renderer and editor interactions
-// ------------------------------------------------------------
-
-function timelineEndBeat() {
-  const noteEnd = currentNotes().reduce(
-    (max, note) => Math.max(max, note.b),
-    0
-  );
-
-  const audioEnd = audioDuration > 0
-    ? Math.max(0, (audioDuration - offsetSeconds()) * bpm() / 60)
-    : 0;
-
-  return Math.max(
-    64,
-    Math.ceil(Math.max(noteEnd, audioEnd) / 16) * 16 + 16
-  );
-}
-
-function timelineNoteRow(note) {
-  return (2 - note.y) * 4 + note.x;
-}
-
-function timelineBeatFromEvent(event) {
-  const rect = timelineCanvas.getBoundingClientRect();
-  const localX = event.clientX - rect.left;
-
-  return Math.max(0, localX / timelineScale);
-}
-
-function timelineRowFromEvent(event) {
-  const rect = timelineCanvas.getBoundingClientRect();
-  const y = event.clientY - rect.top;
-  const row = Math.floor((y - 36) / 14);
-
-  return row >= 0 && row < 12 ? row : null;
-}
-
-function drawTimeline(force = false) {
-  if (!timelineCanvas || !timelineCtx) return;
-
-  const beat = currentBeat();
-
-  if (!force && Math.abs(beat - lastTimelineDraw) < 0.045) {
-    return;
-  }
-
-  lastTimelineDraw = beat;
-
-  const endBeat = timelineEndBeat();
-  const cssWidth = Math.max(
-    1200,
-    Math.ceil(endBeat * timelineScale + 40)
-  );
-
-  const cssHeight = 220;
-  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-
-  if (
-    timelineCanvas.width !== Math.round(cssWidth * dpr) ||
-    timelineCanvas.height !== Math.round(cssHeight * dpr)
-  ) {
-    timelineCanvas.width = Math.round(cssWidth * dpr);
-    timelineCanvas.height = Math.round(cssHeight * dpr);
-
-    timelineCanvas.style.width = `${cssWidth}px`;
-    timelineCanvas.style.height = `${cssHeight}px`;
-  }
-
-  const ctx = timelineCtx;
-
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssWidth, cssHeight);
-
-  ctx.fillStyle = "#0d121c";
-  ctx.fillRect(0, 0, cssWidth, cssHeight);
-
-  const top = 36;
-  const rowH = 14;
-
-  ctx.font = "9px Inter, sans-serif";
-  ctx.textBaseline = "middle";
-  ctx.fillStyle = "#95a2ba";
-
-  for (let row = 0; row < 12; row++) {
-    const y = top + row * rowH;
-
-    ctx.fillStyle = row % 4 < 2 ? "#121a27" : "#101723";
-    ctx.fillRect(0, y, cssWidth, rowH);
-
-    ctx.strokeStyle = "#273247";
-    ctx.lineWidth = 0.6;
-
-    ctx.beginPath();
-    ctx.moveTo(0, y + rowH);
-    ctx.lineTo(cssWidth, y + rowH);
-    ctx.stroke();
-
-    ctx.fillStyle = "#66748d";
-    ctx.fillText(`${2 - Math.floor(row / 4)}:${row % 4}`, 5, y + rowH / 2);
-  }
-
-  ctx.fillStyle = "#9aa8c3";
-  ctx.fillRect(0, 0, cssWidth, 35);
-
-  const totalBeats = Math.floor(cssWidth / timelineScale);
-
-  for (let b = 0; b <= totalBeats; b++) {
-    const x = b * timelineScale;
-    const major = b % 4 === 0;
-
-    ctx.strokeStyle = major
-      ? "#52617b"
-      : (b % 2 === 0 ? "#303c53" : "#202a3b");
-
-    ctx.lineWidth = major ? 1 : 0.55;
-
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, cssHeight);
-    ctx.stroke();
-
-    if (major) {
-      ctx.fillStyle = "#d0d8e8";
-      ctx.fillText(String(b), x + 3, 17);
-
-      ctx.fillStyle = "#6d7b95";
-      ctx.fillText(`bar ${b / 4 + 1}`, x + 3, 29);
-    }
-  }
-
-  for (const note of currentNotes()) {
-    const x = note.b * timelineScale;
-    const y = top + timelineNoteRow(note) * rowH + rowH / 2;
-    const isSelected = note.id === selectedId;
-
-    ctx.beginPath();
-    ctx.fillStyle = note.c === 0 ? "#ff526d" : "#4d9fff";
-
-    ctx.arc(
-      x,
-      y,
-      isSelected ? 5.1 : 4.1,
-      0,
-      Math.PI * 2
-    );
-
-    ctx.fill();
-
-    if (isSelected) {
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 1.5;
-
-      ctx.beginPath();
-      ctx.arc(x, y, 7.5, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-  }
-
-  const px = beat * timelineScale;
-
-  ctx.strokeStyle = "#f3f5ff";
-  ctx.lineWidth = 1.6;
-
-  ctx.beginPath();
-  ctx.moveTo(px, 0);
-  ctx.lineTo(px, cssHeight);
-  ctx.stroke();
-
-  ctx.fillStyle = "#f3f5ff";
-
-  ctx.beginPath();
-  ctx.moveTo(px - 5, 0);
-  ctx.lineTo(px + 5, 0);
-  ctx.lineTo(px, 7);
-  ctx.closePath();
-  ctx.fill();
-
-  $("timelinePosition").textContent = `Beat ${beat.toFixed(3)}`;
-}
-
-timelineCanvas.addEventListener("pointerdown", event => {
-  const beat = timelineBeatFromEvent(event);
-  const row = timelineRowFromEvent(event);
-
-  let nearest = null;
-  let nearestDistance = Infinity;
-
-  if (row !== null) {
-    for (const note of currentNotes()) {
-      if (timelineNoteRow(note) !== row) continue;
-
-      const distance = Math.abs(
-        note.b * timelineScale - beat * timelineScale
-      );
-
-      if (distance < nearestDistance && distance < 11) {
-        nearest = note;
-        nearestDistance = distance;
-      }
-    }
-  }
-
-  if (nearest) {
-    selectNote(nearest.id);
-    pushUndo();
-
-    isTimelineDragging = true;
-    timelineDragId = nearest.id;
-    timelinePointerMoved = false;
-
-    timelineCanvas.setPointerCapture(event.pointerId);
-  } else {
-    seekToBeat(snapBeat(beat));
-  }
+$("audioPicker").addEventListener("change",e=>{
+ const file=e.target.files?.[0];if(!file)return;audioFile=file;if(audioUrl)URL.revokeObjectURL(audioUrl);audioUrl=URL.createObjectURL(file);audio.src=audioUrl;audio.load();
+ audio.onloadedmetadata=()=>{audioDuration=audio.duration;manualBeat=0;showSong();setStatus(`Loaded ${file.name}.`);};
+ audio.onerror=()=>setStatus("The browser could not decode this audio file.");e.target.value="";
 });
+$("projectPicker").addEventListener("change",e=>{const f=e.target.files?.[0];if(f)loadProjectFile(f);e.target.value="";});
 
-timelineCanvas.addEventListener("pointermove", event => {
-  if (!isTimelineDragging || timelineDragId == null) return;
-
-  timelinePointerMoved = true;
-
-  const note = currentNotes().find(
-    item => item.id === timelineDragId
-  );
-
-  if (!note) return;
-
-  const beat = Math.max(
-    0,
-    snapBeat(timelineBeatFromEvent(event))
-  );
-
-  const row = timelineRowFromEvent(event);
-
-  const patch = {
-    b: Number(beat.toFixed(4))
-  };
-
-  if (row !== null) {
-    patch.x = row % 4;
-    patch.y = 2 - Math.floor(row / 4);
-  }
-
-  Object.assign(note, patch);
-
-  const object = editNoteMeshes.get(note.id);
-
-  if (object) {
-    object.position.set(
-      (note.x - 1.5) * GRID_SPACING,
-      (note.y - 1) * GRID_SPACING,
-      0.09
-    );
-  }
-
-  updateInspector();
-  renderNoteList();
-  refreshCounts();
-  drawTimeline(true);
+function addController(index){
+ const c=renderer.xr.getController(index);scene.add(c);
+ const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0),new THREE.Vector3(0,0,-8)]),new THREE.LineBasicMaterial({color:0x9dbdff,transparent:true,opacity:.75}));
+ c.add(line);c.addEventListener("selectstart",()=>controllerClick(c));c.addEventListener("squeezestart",()=>controllerGrab(c));c.addEventListener("squeezeend",()=>dragNote=null);controllers.push(c);
+}
+function controllerRay(c){const p=new THREE.Vector3();const q=new THREE.Quaternion();c.getWorldPosition(p);c.getWorldQuaternion(q);return new THREE.Ray(p,new THREE.Vector3(0,0,-1).applyQuaternion(q));}
+function controllerClick(c){
+ const ray=controllerRay(c);raycaster.ray.copy(ray);const hits=raycaster.intersectObjects(interactive,true);
+ if(hits.length){const o=hits[0].object;if(o.userData.action){o.userData.action();return;}if(o.userData.kind==="cell"){addNote(o.userData.x,o.userData.y);return;}}
+ const noteHits=raycaster.intersectObjects([...noteMeshes.values()],true);if(noteHits.length){const root=noteHits[0].object.parent;selectNote(root.userData.noteId);}
+}
+function controllerGrab(c){
+ const ray=controllerRay(c);raycaster.ray.copy(ray);const hits=raycaster.intersectObjects([...noteMeshes.values()],true);
+ if(hits.length){const root=hits[0].object.parent;const id=root.userData.noteId;selectedId=id;pushUndo();dragNote={id};updateSelection();}
+}
+function updateDrag(c){
+ if(!dragNote)return;const ray=controllerRay(c);const plane=new THREE.Plane(new THREE.Vector3(0,0,1),0.08);const p=new THREE.Vector3();if(!ray.intersectPlane(plane,p))return;
+ const x=Math.max(0,Math.min(3,Math.round(p.x/CELL+1.5))),y=Math.max(0,Math.min(2,Math.round(p.y/CELL+1)));
+ const n=currentNotes().find(n=>n.id===dragNote.id);if(!n)return;n.x=x;n.y=y;const g=noteMeshes.get(n.id);g.position.set((x-1.5)*CELL,(y-1)*CELL,-.08);
+}
+addController(0);addController(1);
+renderer.domElement.addEventListener("pointerdown",e=>{
+ if(renderer.xr.isPresenting)return;pointer.x=e.clientX/innerWidth*2-1;pointer.y=-(e.clientY/innerHeight)*2+1;raycaster.setFromCamera(pointer,camera);
+ const hits=raycaster.intersectObjects(interactive,true);if(hits.length&&hits[0].object.userData.action)hits[0].object.userData.action();
+ else if(hits.length&&hits[0].object.userData.kind==="cell")addNote(hits[0].object.userData.x,hits[0].object.userData.y);
 });
-
-function endTimelineDrag() {
-  if (isTimelineDragging) {
-    isTimelineDragging = false;
-    timelineDragId = null;
-
-    drawTimeline(true);
-    setStatus("Note moved on the timeline.", "success");
-  }
+renderer.xr.addEventListener("sessionstart",()=>setStatus("VR active. Trigger selects, grip grabs notes."));
+renderer.xr.addEventListener("sessionend",()=>setStatus("Desktop preview mode."));
+window.addEventListener("resize",()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+function animate(){
+ const now=performance.now();const dt=Math.min(.05,(now-lastFrame)/1000);lastFrame=now;
+ if(!audio.paused&&audio.currentTime>=audioDuration){audio.pause();isPlaying=false;}
+ if(renderer.xr.isPresenting&&dragNote){const c=controllers.find(x=>x.inputSource?.handedness==="right")||controllers[0];if(c)updateDrag(c);}
+ renderer.render(scene,camera);
 }
-
-timelineCanvas.addEventListener("pointerup", endTimelineDrag);
-timelineCanvas.addEventListener("pointercancel", endTimelineDrag);
-
-// ------------------------------------------------------------
-// UI refresh and inspector
-// ------------------------------------------------------------
-
-function refreshCounts() {
-  $("noteCount").textContent = `${currentNotes().length} notes`;
-
-  $("selectedDifficultyLabel").textContent =
-    activeDifficulty === "ExpertPlus" ? "Expert+" : activeDifficulty;
-}
-
-function refreshDifficultyCount() {
-  const count = DIFFICULTIES.filter(name => levels[name]).length;
-  $("difficultyCount").textContent = String(count);
-}
-
-function updateInspector() {
-  const note = selectedNote();
-
-  if (!note) {
-    $("selectedInfo").textContent = "No note selected";
-    $("selectedBeatInput").value = "";
-    $("selectedAngleInput").value = "0";
-    $("selectedBeatInput").disabled = true;
-    $("selectedAngleInput").disabled = true;
-    return;
-  }
-
-  $("selectedInfo").textContent =
-    `${note.c === 0 ? "Red" : "Blue"} note · column ${note.x} · row ${note.y} · ${DIRECTIONS[note.d]}`;
-
-  $("selectedBeatInput").disabled = false;
-  $("selectedAngleInput").disabled = false;
-
-  $("selectedBeatInput").value = note.b.toFixed(4);
-  $("selectedAngleInput").value = note.a || 0;
-
-  $("noteColor").value = String(note.c);
-  $("noteDirection").value = String(note.d);
-  $("gridX").value = String(note.x);
-  $("gridY").value = String(note.y);
-}
-
-function renderNoteList() {
-  const list = $("noteList");
-  list.replaceChildren();
-
-  if (!currentNotes().length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-list";
-    empty.textContent = "No notes in this difficulty";
-    list.appendChild(empty);
-    return;
-  }
-
-  const sorted = [...currentNotes()]
-    .sort((a, b) => a.b - b.b)
-    .slice(0, 50);
-
-  for (const note of sorted) {
-    const item = document.createElement("div");
-
-    item.className =
-      "note-item" + (note.id === selectedId ? " active" : "");
-
-    const main = document.createElement("div");
-    main.className = "note-main";
-
-    const dot = document.createElement("i");
-    dot.className =
-      `note-dot ${note.c === 0 ? "red" : "blue"}`;
-
-    const text = document.createElement("span");
-
-    text.textContent =
-      `Beat ${note.b.toFixed(3)} · ${note.x},${note.y}`;
-
-    main.append(dot, text);
-
-    const direction = document.createElement("small");
-    direction.textContent = DIRECTIONS[note.d];
-
-    item.append(main, direction);
-
-    item.onclick = () => {
-      selectNote(note.id);
-      seekToBeat(note.b, true);
-    };
-
-    list.appendChild(item);
-  }
-}
-
-function updateTransportReadout() {
-  const time = audioElement
-    ? audioElement.currentTime
-    : manualBeat * 60 / bpm() + offsetSeconds();
-
-  const total = audioDuration;
-
-  $("currentTime").textContent = formatTime(time);
-
-  $("totalTime").textContent =
-    total > 0 ? formatTime(total).split(".")[0] : "0:00";
-
-  $("audioSeek").value =
-    total > 0
-      ? String(Math.min(1000, Math.max(0, time / total * 1000)))
-      : "0";
-}
-
-function formatTime(seconds) {
-  const safe = Math.max(0, Number(seconds) || 0);
-  const minutes = Math.floor(safe / 60);
-  const remain = (safe % 60).toFixed(3).padStart(6, "0");
-
-  return `${minutes}:${remain}`;
-}
-
-// ------------------------------------------------------------
-// Audio import, playback and metronome
-// ------------------------------------------------------------
-
-async function importAudio(file) {
-  if (!file) return;
-
-  if (audioElement) {
-    audioElement.pause();
-    audioElement.src = "";
-  }
-
-  if (audioURL) URL.revokeObjectURL(audioURL);
-
-  audioFile = file;
-  audioURL = URL.createObjectURL(file);
-
-  audioElement = new Audio();
-  audioElement.preload = "metadata";
-  audioElement.src = audioURL;
-
-  await new Promise((resolve, reject) => {
-    audioElement.addEventListener(
-      "loadedmetadata",
-      resolve,
-      { once: true }
-    );
-
-    audioElement.addEventListener(
-      "error",
-      () => reject(new Error("The browser could not read this audio file.")),
-      { once: true }
-    );
-
-    audioElement.load();
-  });
-
-  audioDuration = Number.isFinite(audioElement.duration)
-    ? audioElement.duration
-    : 0;
-
-  manualBeat = 0;
-
-  $("audioName").textContent = file.name;
-  $("audioStatus").textContent = "AUDIO LOADED";
-  $("audioStatus").classList.add("loaded");
-  $("playBtn").textContent = "▶ Play";
-
-  refreshVrControls();
-  updateTransportReadout();
-  drawTimeline(true);
-
-  setStatus(
-    `Loaded ${file.name}. Audio is kept in this browser until you export.`,
-    "success"
-  );
-}
-
-async function togglePlayback() {
-  if (!audioElement) {
-    setStatus("Import an audio file before playing.");
-    return;
-  }
-
-  try {
-    if (audioElement.paused) {
-      await audioElement.play();
-
-      $("playBtn").textContent = "Ⅱ Pause";
-
-      if (metronomeEnabled) {
-        await ensureMetronomeContext();
-      }
-    } else {
-      audioElement.pause();
-      $("playBtn").textContent = "▶ Play";
-    }
-
-    refreshVrControls();
-  } catch (error) {
-    setStatus(`Playback error: ${error.message}`, "error");
-  }
-}
-
-function stopPlayback() {
-  if (audioElement) {
-    audioElement.pause();
-    audioElement.currentTime = 0;
-  }
-
-  manualBeat = 0;
-
-  $("playBtn").textContent = "▶ Play";
-
-  refreshVrControls();
-
-  lastMetronomeBeat = -1;
-
-  updateTransportReadout();
-  drawTimeline(true);
-}
-
-function ensureMetronomeContext() {
-  if (!metronomeContext) {
-    const AudioCtx =
-      window.AudioContext || window.webkitAudioContext;
-
-    if (!AudioCtx) {
-      throw new Error("Web Audio is not supported in this browser.");
-    }
-
-    metronomeContext = new AudioCtx();
-  }
-
-  return metronomeContext.resume();
-}
-
-function metronomeClick(accent = false) {
-  if (!metronomeContext) return;
-
-  const osc = metronomeContext.createOscillator();
-  const gain = metronomeContext.createGain();
-
-  osc.type = "sine";
-  osc.frequency.value = accent ? 1450 : 950;
-
-  gain.gain.setValueAtTime(
-    accent ? 0.09 : 0.055,
-    metronomeContext.currentTime
-  );
-
-  gain.gain.exponentialRampToValueAtTime(
-    0.0001,
-    metronomeContext.currentTime + 0.045
-  );
-
-  osc.connect(gain);
-  gain.connect(metronomeContext.destination);
-
-  osc.start();
-  osc.stop(metronomeContext.currentTime + 0.05);
-}
-
-async function toggleMetronome() {
-  metronomeEnabled = !metronomeEnabled;
-
-  $("metronomeBtn").classList.toggle(
-    "active",
-    metronomeEnabled
-  );
-
-  $("metronomeBtn").textContent =
-    metronomeEnabled ? "Metronome on" : "Metronome off";
-
-  if (metronomeEnabled) {
-    try {
-      await ensureMetronomeContext();
-
-      lastMetronomeBeat = Math.floor(currentBeat()) - 1;
-    } catch (error) {
-      metronomeEnabled = false;
-
-      $("metronomeBtn").classList.remove("active");
-      $("metronomeBtn").textContent = "Metronome off";
-
-      setStatus(error.message, "error");
-    }
-  }
-}
-
-function updateMetronome() {
-  if (
-    !metronomeEnabled ||
-    !audioElement ||
-    audioElement.paused
-  ) return;
-
-  const beat = Math.floor(currentBeat() + 0.0001);
-
-  if (beat > lastMetronomeBeat) {
-    const count = Math.min(
-      beat - lastMetronomeBeat,
-      5
-    );
-
-    for (let i = 0; i < count; i++) {
-      const tickBeat = lastMetronomeBeat + i + 1;
-
-      metronomeClick(tickBeat % 4 === 0);
-    }
-
-    lastMetronomeBeat = beat;
-  }
-}
-
-// ------------------------------------------------------------
-// Focus the editing board on the current beat.
-// The timeline still retains every note, but VR only shows
-// notes at the playhead plus the selected note.
-// ------------------------------------------------------------
-
-function updateEditorNoteVisibility() {
-  const beat = currentBeat();
-  const snap = Number($("snap").value) || 0.125;
-  const windowBeats = Math.max(0.06, snap * 0.55);
-
-  for (const note of currentNotes()) {
-    const object = editNoteMeshes.get(note.id);
-
-    if (object) {
-      object.visible =
-        note.id === selectedId ||
-        Math.abs(note.b - beat) <= windowBeats;
-    }
-  }
-}
-
-// ------------------------------------------------------------
-// Incoming-note visual preview
-// ------------------------------------------------------------
-
-function updateIncomingPreview() {
-  const beat = currentBeat();
-  const notes = currentNotes();
-  const needed = new Set();
-
-  for (const note of notes) {
-    const secondsUntil =
-      (note.b - beat) * 60 / bpm();
-
-    if (
-      secondsUntil <= 0 ||
-      secondsUntil > PREVIEW_SECONDS
-    ) continue;
-
-    needed.add(note.id);
-
-    let object = previewNoteMeshes.get(note.id);
-
-    if (!object) {
-      object = createNoteMesh(note, true);
-      previewNoteMeshes.set(note.id, object);
-    }
-
-    const progress =
-      1 - secondsUntil / PREVIEW_SECONDS;
-
-    object.position.z = -10.6 + progress * 7.48;
-
-    object.position.x =
-      (note.x - 1.5) * GRID_SPACING;
-
-    object.position.y =
-      (note.y - 1) * GRID_SPACING;
-
-    object.children[1].rotation.z =
-      directionRotation(note.d, note.a);
-
-    object.visible = true;
-  }
-
-  for (const [id, object] of previewNoteMeshes) {
-    if (!needed.has(id)) {
-      editorRoot.remove(object);
-      disposeObject(object);
-      previewNoteMeshes.delete(id);
-    }
-  }
-}
-
-// ------------------------------------------------------------
-// WebXR controls and desktop pointer controls
-// ------------------------------------------------------------
-
-function resolveHitObject(object) {
-  let current = object;
-
-  while (
-    current &&
-    current !== editorRoot &&
-    !current.userData?.kind
-  ) {
-    current = current.parent;
-  }
-
-  return current && current !== editorRoot
-    ? current
-    : null;
-}
-
-function raycastEditor(rayOrigin, rayDirection) {
-  raycaster.ray.origin.copy(rayOrigin);
-  raycaster.ray.direction.copy(rayDirection).normalize();
-
-  const hits = raycaster.intersectObjects(
-    editorRoot.children,
-    true
-  );
-
-  for (const hit of hits) {
-    const target = resolveHitObject(hit.object);
-
-    if (
-      target &&
-      target.userData.kind === "note" &&
-      !target.visible
-    ) continue;
-
-    if (
-      target &&
-      ["note", "cell", "difficulty", "action"].includes(
-        target.userData.kind
-      )
-    ) {
-      return {
-        target,
-        point: hit.point
-      };
-    }
-  }
-
-  return null;
-}
-
-function handleControllerSelect(controller) {
-  tempMatrix.identity().extractRotation(controller.matrixWorld);
-
-  const origin = new THREE.Vector3().setFromMatrixPosition(
-    controller.matrixWorld
-  );
-
-  const direction = new THREE.Vector3(0, 0, -1)
-    .applyMatrix4(tempMatrix)
-    .normalize();
-
-  const hit = raycastEditor(origin, direction);
-
-  if (!hit) return;
-
-  if (hit.target.userData.kind === "note") {
-    selectNote(hit.target.userData.id);
-    return;
-  }
-
-  if (hit.target.userData.kind === "cell") {
-    addNoteAt(
-      hit.target.userData.x,
-      hit.target.userData.y,
-      currentBeat()
-    );
-
-    return;
-  }
-
-  if (hit.target.userData.kind === "difficulty") {
-    switchDifficulty(hit.target.userData.value);
-    return;
-  }
-
-  if (hit.target.userData.kind === "action") {
-    if (hit.target.userData.value === "playpause") {
-      togglePlayback();
-    } else if (hit.target.userData.value === "stop") {
-      stopPlayback();
-    }
-  }
-}
-
-function beginControllerDrag(controller) {
-  tempMatrix.identity().extractRotation(controller.matrixWorld);
-
-  const origin = new THREE.Vector3().setFromMatrixPosition(
-    controller.matrixWorld
-  );
-
-  const direction = new THREE.Vector3(0, 0, -1)
-    .applyMatrix4(tempMatrix)
-    .normalize();
-
-  const hit = raycastEditor(origin, direction);
-
-  if (!hit || hit.target.userData.kind !== "note") return;
-
-  const id = hit.target.userData.id;
-
-  selectNote(id);
-  pushUndo();
-
-  vrDrag = { controller, id };
-}
-
-function updateControllerDrag() {
-  if (!vrDrag) return;
-
-  const { controller, id } = vrDrag;
-
-  tempMatrix.identity().extractRotation(controller.matrixWorld);
-
-  const origin = new THREE.Vector3().setFromMatrixPosition(
-    controller.matrixWorld
-  );
-
-  const direction = new THREE.Vector3(0, 0, -1)
-    .applyMatrix4(tempMatrix)
-    .normalize();
-
-  raycaster.ray.origin.copy(origin);
-  raycaster.ray.direction.copy(direction);
-
-  const worldPoint = new THREE.Vector3();
-
-  if (!raycaster.ray.intersectPlane(editPlane, worldPoint)) {
-    return;
-  }
-
-  const local = editorRoot.worldToLocal(worldPoint);
-
-  const x = Math.min(
-    3,
-    Math.max(0, Math.round(local.x / GRID_SPACING + 1.5))
-  );
-
-  const y = Math.min(
-    2,
-    Math.max(0, Math.round(local.y / GRID_SPACING + 1))
-  );
-
-  const note = currentNotes().find(item => item.id === id);
-
-  if (!note) return;
-
-  note.x = x;
-  note.y = y;
-
-  const object = editNoteMeshes.get(id);
-
-  if (object) {
-    object.position.set(
-      (x - 1.5) * GRID_SPACING,
-      (y - 1) * GRID_SPACING,
-      0.09
-    );
-  }
-
-  updateInspector();
-  renderNoteList();
-  drawTimeline();
-}
-
-function endControllerDrag() {
-  if (!vrDrag) return;
-
-  vrDrag = null;
-
-  drawTimeline(true);
-  setStatus("Note moved to a new grid cell.", "success");
-}
-
-function setupController(index) {
-  const controller = renderer.xr.getController(index);
-
-  controller.userData.controllerIndex = index;
-  scene.add(controller);
-
-  const beamGeometry = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(0, 0, 0),
-    new THREE.Vector3(0, 0, -5)
-  ]);
-
-  const beam = new THREE.Line(
-    beamGeometry,
-    new THREE.LineBasicMaterial({
-      color: 0xaabaff,
-      transparent: true,
-      opacity: 0.72
-    })
-  );
-
-  controller.add(beam);
-
-  controller.addEventListener("selectstart", () => {
-    handleControllerSelect(controller);
-  });
-
-  controller.addEventListener("squeezestart", () => {
-    beginControllerDrag(controller);
-  });
-
-  controller.addEventListener("squeezeend", endControllerDrag);
-
-  controller.addEventListener("connected", event => {
-    controller.userData.gamepad =
-      event.data?.gamepad || null;
-
-    controller.userData.source = event.data || null;
-  });
-
-  controller.addEventListener("disconnected", () => {
-    controller.userData.gamepad = null;
-  });
-
-  controllerObjects.push(controller);
-}
-
-setupController(0);
-setupController(1);
-
-
-// ------------------------------------------------------------
-// Controller button polling
-// ------------------------------------------------------------
-
-function pollControllerButtons() {
-  for (const controller of controllerObjects) {
-    const gamepad = controller.userData.gamepad;
-
-    if (!gamepad?.buttons) continue;
-
-    let state = controllerButtonStates.get(controller);
-
-    if (!state) {
-      state = {
-        rotate: false,
-        color: false,
-        deselect: false
-      };
-
-      controllerButtonStates.set(controller, state);
-    }
-
-    const deselectPressed = Boolean(gamepad.buttons[3]?.pressed);
-    const rotatePressed = Boolean(gamepad.buttons[4]?.pressed);
-    const colorPressed = Boolean(gamepad.buttons[5]?.pressed);
-
-    if (deselectPressed && !state.deselect) {
-      selectNote(null);
-    }
-
-    if (rotatePressed && !state.rotate && selectedNote()) {
-      rotateSelected();
-    }
-
-    if (colorPressed && !state.color && selectedNote()) {
-      const note = selectedNote();
-
-      updateNote(note.id, {
-        c: note.c === 0 ? 1 : 0
-      });
-    }
-
-    // Thumbstick left/right adjusts the grid column.
-    // Up/down adjusts beat time.
-    const axes = gamepad.axes || [];
-
-    const axisX = axes.length >= 4
-      ? (axes[2] || 0)
-      : (axes[0] || 0);
-
-    const axisY = axes.length >= 4
-      ? (axes[3] || 0)
-      : (axes[1] || 0);
-
-    const axisActive =
-      Math.max(Math.abs(axisX), Math.abs(axisY)) > 0.72;
-
-    const nowMs = performance.now();
-
-    if (
-      axisActive &&
-      nowMs - (state.lastAxisAt || 0) > 260
-    ) {
-      state.lastAxisAt = nowMs;
-
-      const step = Number($("snap").value) || 0.25;
-      const note = selectedNote();
-
-      if (Math.abs(axisY) > Math.abs(axisX)) {
-        const delta = axisY < 0 ? step : -step;
-
-        if (note) {
-          updateNote(note.id, {
-            b: Math.max(0, Number((note.b + delta).toFixed(4)))
-          });
-        } else {
-          seekToBeat(Math.max(0, currentBeat() + delta));
-        }
-      } else if (note) {
-        const nextX = Math.min(
-          3,
-          Math.max(0, note.x + (axisX > 0 ? 1 : -1))
-        );
-
-        updateNote(note.id, { x: nextX });
-      }
-    }
-
-    state.deselect = deselectPressed;
-    state.rotate = rotatePressed;
-    state.color = colorPressed;
-  }
-}
-
-function handleDesktopPointer(event) {
-  if (renderer.xr.isPresenting) return;
-
-  const rect = renderer.domElement.getBoundingClientRect();
-
-  pointer.x =
-    ((event.clientX - rect.left) / rect.width) * 2 - 1;
-
-  pointer.y =
-    -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-  raycaster.setFromCamera(pointer, camera);
-
-  const hits = raycaster.intersectObjects(
-    editorRoot.children,
-    true
-  );
-
-  for (const hit of hits) {
-    const target = resolveHitObject(hit.object);
-
-    if (!target || !["note", "cell"].includes(target.userData.kind)) {
-      continue;
-    }
-
-    if (target.userData.kind === "note") {
-      selectNote(target.userData.id);
-    } else if (target.userData.kind === "cell") {
-      addNoteAt(
-        target.userData.x,
-        target.userData.y,
-        currentBeat()
-      );
-    } else if (target.userData.kind === "difficulty") {
-      switchDifficulty(target.userData.value);
-    } else if (target.userData.kind === "action") {
-      if (target.userData.value === "playpause") {
-        togglePlayback();
-      } else if (target.userData.value === "stop") {
-        stopPlayback();
-      }
-    }
-
-    return;
-  }
-}
-
-renderer.domElement.addEventListener(
-  "pointerdown",
-  handleDesktopPointer
-);
-
-renderer.xr.addEventListener("sessionstart", () => {
-  $("vrStatus").textContent = "VR session active";
-
-  $("viewportHelp").textContent =
-    "Aim at a grid cell and press trigger to place. Grab a cube with grip and point at another cell to move it.";
-});
-
-renderer.xr.addEventListener("sessionend", () => {
-  $("vrStatus").textContent = "Desktop mode";
-
-  endControllerDrag();
-});
-
-// Replace the placeholder button with Three.js's WebXR session button.
-const xrButton = XRButton.createButton(
-  renderer,
-  {
-    optionalFeatures: ["local-floor", "bounded-floor"]
-  }
-);
-
-xrButton.id = "vrButton";
-xrButton.className = "vr-button";
-xrButton.textContent = "Enter VR";
-
-$("vrButton").replaceWith(xrButton);
-
-// ------------------------------------------------------------
-// Project save / load
-// ------------------------------------------------------------
-
-function projectObject() {
-  return {
-    projectFormat: "vr-map-editor-project",
-    projectVersion: 2,
-
-    metadata: {
-      title: $("songTitle").value,
-      artist: $("songArtist").value,
-      mapper: $("mapperName").value,
-      bpm: bpm(),
-      offset: offsetSeconds()
-    },
-
-    levels: cloneLevels(levels)
-  };
-}
-
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-
-  anchor.href = url;
-  anchor.download = filename;
-
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-
-  setTimeout(() => URL.revokeObjectURL(url), 2500);
-}
-
-function saveProject() {
-  const name = slugify(
-    $("songTitle").value || "untitled-map"
-  );
-
-  const blob = new Blob(
-    [JSON.stringify(projectObject(), null, 2)],
-    { type: "application/json" }
-  );
-
-  downloadBlob(blob, `${name}.bsmapproject.json`);
-
-  setStatus(
-    "Project saved as JSON. Audio is not embedded, so re-import it when reopening the project.",
-    "success"
-  );
-}
-
-async function loadProject(file) {
-  const parsed = JSON.parse(await file.text());
-
-  if (
-    parsed.projectFormat !== "vr-map-editor-project" ||
-    !parsed.levels
-  ) {
-    throw new Error("This is not a VR Map Editor project file.");
-  }
-
-  const nextLevels = {};
-
-  for (const name of DIFFICULTIES) {
-    const items = Array.isArray(parsed.levels[name])
-      ? parsed.levels[name]
-      : [];
-
-    nextLevels[name] = items.map(note => ({
-      id: Number(note.id) || nextNoteId++,
-
-      b: Math.max(
-        0,
-        Number(note.b) || 0
-      ),
-
-      x: Math.min(
-        3,
-        Math.max(0, Number(note.x) || 0)
-      ),
-
-      y: Math.min(
-        2,
-        Math.max(0, Number(note.y) || 0)
-      ),
-
-      c: Number(note.c) === 1 ? 1 : 0,
-
-      d: Math.min(
-        8,
-        Math.max(0, Number(note.d) || 0)
-      ),
-
-      a: Number(note.a) || 0
-    }));
-  }
-
-  pushUndo();
-
-  levels = nextLevels;
-
-  const allIds = Object.values(levels)
-    .flat()
-    .map(note => note.id);
-
-  nextNoteId = Math.max(1, ...allIds) + 1;
-
-  const meta = parsed.metadata || {};
-
-  $("songTitle").value = meta.title || "Untitled Map";
-  $("songArtist").value = meta.artist || "Unknown Artist";
-  $("mapperName").value = meta.mapper || "Mapper";
-
-  $("bpm").value =
-    Number(meta.bpm) > 0 ? meta.bpm : 120;
-
-  $("songOffset").value = Number(meta.offset) || 0;
-
-  activeDifficulty = "Expert";
-  selectedId = null;
-
-  document.querySelectorAll("#difficultyGrid button").forEach(button => {
-    button.classList.toggle(
-      "active",
-      button.dataset.difficulty === activeDifficulty
-    );
-  });
-
-  rebuildAllViews();
-
-  setStatus(
-    "Project loaded. Re-import the audio file to play or export a complete song.",
-    "success"
-  );
-}
-
-function slugify(value) {
-  return String(value || "song")
-    .normalize("NFKD")
-    .replace(/[^a-zA-Z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .toLowerCase() || "song";
-}
-
-// ------------------------------------------------------------
-// OGG conversion and ZIP generation
-// ------------------------------------------------------------
-
-async function getFFmpeg() {
-  if (ffmpegInstance) return ffmpegInstance;
-  if (ffmpegLoadPromise) return ffmpegLoadPromise;
-
-  ffmpegLoadPromise = (async () => {
-    setStatus(
-      "Loading audio converter. The single-thread FFmpeg WebAssembly core is about 31 MB and is downloaded on first conversion."
-    );
-
-    const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
-      import(
-        "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js"
-      ),
-
-      import(
-        "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js"
-      )
-    ]);
-
-    const ffmpeg = new FFmpeg();
-
-    const baseURL =
-      "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
-
-    ffmpeg.on("log", ({ message }) => {
-      if (message && /error/i.test(message)) {
-        setStatus(
-          `Audio converter: ${message.slice(0, 180)}`
-        );
-      }
-    });
-
-    ffmpeg.on("progress", ({ progress }) => {
-      if (Number.isFinite(progress)) {
-        setStatus(
-          `Converting audio to OGG · ${Math.round(progress * 100)}%`
-        );
-      }
-    });
-
-    await ffmpeg.load({
-      coreURL: await toBlobURL(
-        `${baseURL}/ffmpeg-core.js`,
-        "text/javascript"
-      ),
-
-      wasmURL: await toBlobURL(
-        `${baseURL}/ffmpeg-core.wasm`,
-        "application/wasm"
-      )
-    });
-
-    ffmpegInstance = ffmpeg;
-
-    return ffmpegInstance;
-  })();
-
-  try {
-    return await ffmpegLoadPromise;
-  } catch (error) {
-    ffmpegLoadPromise = null;
-    throw error;
-  }
-}
-
-async function getOggAudio() {
-  if (!audioFile) {
-    throw new Error(
-      "Import an audio file before exporting the song ZIP."
-    );
-  }
-
-  const name = audioFile.name.toLowerCase();
-
-  const signature = new Uint8Array(
-    await audioFile.slice(0, 4).arrayBuffer()
-  );
-
-  const alreadyOgg =
-    name.endsWith(".ogg") ||
-    (
-      signature[0] === 0x4f &&
-      signature[1] === 0x67 &&
-      signature[2] === 0x67 &&
-      signature[3] === 0x53
-    );
-
-  if (alreadyOgg) {
-    return new Uint8Array(
-      await audioFile.arrayBuffer()
-    );
-  }
-
-  const ffmpeg = await getFFmpeg();
-
-  const ext = (
-    name.match(/\.([a-z0-9]{1,8})$/)?.[1] || "audio"
-  ).replace(/[^a-z0-9]/g, "");
-
-  const inputName = `input.${ext}`;
-
-  await ffmpeg.writeFile(
-    inputName,
-    new Uint8Array(await audioFile.arrayBuffer())
-  );
-
-  const result = await ffmpeg.exec([
-    "-y",
-    "-i",
-    inputName,
-    "-vn",
-    "-c:a",
-    "libvorbis",
-    "-q:a",
-    "5",
-    "song.ogg"
-  ]);
-
-  if (result !== 0) {
-    throw new Error(
-      "FFmpeg could not convert this audio file to OGG Vorbis."
-    );
-  }
-
-  const output = await ffmpeg.readFile("song.ogg");
-
-  return output instanceof Uint8Array
-    ? output
-    : new Uint8Array(output);
-}
-
-// ------------------------------------------------------------
-// ZIP file generation
-// ------------------------------------------------------------
-
-const crcTable = (() => {
-  const table = new Uint32Array(256);
-
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-
-    for (let k = 0; k < 8; k++) {
-      c = (c & 1)
-        ? (0xedb88320 ^ (c >>> 1))
-        : (c >>> 1);
-    }
-
-    table[n] = c >>> 0;
-  }
-
-  return table;
-})();
-
-function crc32(bytes) {
-  let crc = 0xffffffff;
-
-  for (let i = 0; i < bytes.length; i++) {
-    crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  }
-
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function concatBytes(parts) {
-  const size = parts.reduce(
-    (sum, part) => sum + part.length,
-    0
-  );
-
-  const result = new Uint8Array(size);
-  let offset = 0;
-
-  for (const part of parts) {
-    result.set(part, offset);
-    offset += part.length;
-  }
-
-  return result;
-}
-
-function makeStoredZip(entries) {
-  const encoder = new TextEncoder();
-
-  const localParts = [];
-  const centralParts = [];
-
-  let localOffset = 0;
-
-  for (const entry of entries) {
-    const name = encoder.encode(entry.name);
-
-    const data = typeof entry.data === "string"
-      ? encoder.encode(entry.data)
-      : entry.data;
-
-    const checksum = crc32(data);
-
-    const local = new Uint8Array(30 + name.length);
-    const lv = new DataView(local.buffer);
-
-    lv.setUint32(0, 0x04034b50, true);
-    lv.setUint16(4, 20, true);
-    lv.setUint16(6, 0x0800, true);
-    lv.setUint16(8, 0, true);
-    lv.setUint16(10, 0, true);
-    lv.setUint16(12, 0x21, true);
-    lv.setUint32(14, checksum, true);
-    lv.setUint32(18, data.length, true);
-    lv.setUint32(22, data.length, true);
-    lv.setUint16(26, name.length, true);
-    lv.setUint16(28, 0, true);
-
-    local.set(name, 30);
-
-    localParts.push(local, data);
-
-    const central = new Uint8Array(46 + name.length);
-    const cv = new DataView(central.buffer);
-
-    cv.setUint32(0, 0x02014b50, true);
-    cv.setUint16(4, 20, true);
-    cv.setUint16(6, 20, true);
-    cv.setUint16(8, 0x0800, true);
-    cv.setUint16(10, 0, true);
-    cv.setUint16(12, 0, true);
-    cv.setUint16(14, 0x21, true);
-    cv.setUint32(16, checksum, true);
-    cv.setUint32(20, data.length, true);
-    cv.setUint32(24, data.length, true);
-    cv.setUint16(28, name.length, true);
-    cv.setUint16(30, 0, true);
-    cv.setUint16(32, 0, true);
-    cv.setUint16(34, 0, true);
-    cv.setUint16(36, 0, true);
-    cv.setUint32(38, 0, true);
-    cv.setUint32(42, localOffset, true);
-
-    central.set(name, 46);
-    centralParts.push(central);
-
-    localOffset += local.length + data.length;
-  }
-
-  const centralBytes = concatBytes(centralParts);
-
-  const end = new Uint8Array(22);
-  const ev = new DataView(end.buffer);
-
-  ev.setUint32(0, 0x06054b50, true);
-  ev.setUint16(4, 0, true);
-  ev.setUint16(6, 0, true);
-  ev.setUint16(8, entries.length, true);
-  ev.setUint16(10, entries.length, true);
-  ev.setUint32(12, centralBytes.length, true);
-  ev.setUint32(16, localOffset, true);
-  ev.setUint16(20, 0, true);
-
-  return concatBytes([
-    ...localParts,
-    centralBytes,
-    end
-  ]);
-}
-
-function makeV3Beatmap(notes) {
-  return {
-    version: "3.3.0",
-
-    bpmEvents: [],
-    rotationEvents: [],
-
-    colorNotes: notes
-      .map(note => ({
-        b: note.b,
-        x: note.x,
-        y: note.y,
-        c: note.c,
-        d: note.d,
-        a: note.a || 0
-      }))
-      .sort((a, b) => a.b - b.b),
-
-    bombNotes: [],
-    obstacles: [],
-    sliders: [],
-    burstSliders: [],
-
-    basicBeatmapEvents: [],
-    colorBoostBeatmapEvents: [],
-    waypoints: [],
-
-    basicEventTypesWithKeywords: {
-      d: []
-    },
-
-    lightColorEventBoxGroups: [],
-    lightRotationEventBoxGroups: [],
-    lightTranslationEventBoxGroups: [],
-    vfxEventBoxGroups: [],
-
-    useNormalEventsAsCompatibleEvents: false
-  };
-}
-
-function makeInfoDat() {
-  const difficultyBeatmaps = DIFFICULTIES
-    .filter(name => Array.isArray(levels[name]))
-    .map(name => ({
-      _difficulty: name,
-      _difficultyRank: RANKS[name],
-      _beatmapFilename: `${name}Standard.dat`,
-
-      _noteJumpMovementSpeed:
-        name === "ExpertPlus"
-          ? 16
-          : name === "Expert"
-            ? 14
-            : 10,
-
-      _noteJumpStartBeatOffset: 0,
-      _environmentNameIdx: 0
-    }));
-
-  return {
-    _version: "2.1.0",
-
-    _songName:
-      $("songTitle").value.trim() || "Untitled Map",
-
-    _songSubName: "",
-
-    _songAuthorName:
-      $("songArtist").value.trim() || "Unknown Artist",
-
-    _levelAuthorName:
-      $("mapperName").value.trim() || "Mapper",
-
-    _beatsPerMinute: bpm(),
-    _songTimeOffset: offsetSeconds(),
-
-    _shuffle: 0,
-    _shufflePeriod: 0,
-
-    _previewStartTime: 0,
-    _previewDuration: 10,
-
-    _songFilename: "song.ogg",
-    _coverImageFilename: "",
-
-    _environmentName: "DefaultEnvironment",
-    _allDirectionsEnvironmentName: "GlassDesertEnvironment",
-
-    _environmentNames: [
-      "DefaultEnvironment",
-      "GlassDesertEnvironment"
-    ],
-
-    _difficultyBeatmapSets: [
-      {
-        _beatmapCharacteristicName: "Standard",
-        _difficultyBeatmaps: difficultyBeatmaps
-      }
-    ]
-  };
-}
-
-async function exportSongZip() {
-  if (!audioFile) {
-    setStatus(
-      "Import a song before exporting a complete Beat Saber ZIP.",
-      "error"
-    );
-
-    return;
-  }
-
-  const button = $("exportBtn");
-  button.disabled = true;
-
-  const oldText = button.textContent;
-  button.textContent = "Preparing…";
-
-  try {
-    const audioBytes = await getOggAudio();
-
-    const entries = [
-      {
-        name: "Info.dat",
-        data: JSON.stringify(makeInfoDat(), null, 2)
-      }
-    ];
-
-    for (const name of DIFFICULTIES) {
-      entries.push({
-        name: `${name}Standard.dat`,
-        data: JSON.stringify(
-          makeV3Beatmap(levels[name]),
-          null,
-          2
-        )
-      });
-    }
-
-    entries.push({
-      name: "song.ogg",
-      data: audioBytes
-    });
-
-    setStatus("Building song ZIP…");
-
-    const zipBytes = makeStoredZip(entries);
-
-    const zipBlob = new Blob(
-      [zipBytes],
-      { type: "application/zip" }
-    );
-
-    const filename =
-      `${slugify($("songTitle").value || "untitled-map")}.zip`;
-
-    downloadBlob(zipBlob, filename);
-
-    setStatus(
-      `Exported ${filename} with Info.dat, five difficulties and OGG audio.`,
-      "success",
-      9000
-    );
-
-  } catch (error) {
-    console.error(error);
-
-    setStatus(
-      `Export failed: ${error.message || error}`,
-      "error",
-      10000
-    );
-
-  } finally {
-    button.disabled = false;
-    button.textContent = oldText;
-  }
-}
-
-// ------------------------------------------------------------
-// Event wiring
-// ------------------------------------------------------------
-
-$("audioInput").addEventListener("change", event => {
-  const file = event.target.files?.[0];
-
-  if (file) {
-    importAudio(file).catch(error => {
-      setStatus(error.message, "error");
-    });
-  }
-
-  event.target.value = "";
-});
-
-$("playBtn").onclick = togglePlayback;
-$("stopBtn").onclick = stopPlayback;
-
-$("audioSeek").oninput = event => {
-  if (!audioElement || !audioDuration) return;
-
-  const time =
-    Number(event.target.value) / 1000 * audioDuration;
-
-  audioElement.currentTime = time;
-
-  manualBeat = Math.max(
-    0,
-    (time - offsetSeconds()) * bpm() / 60
-  );
-
-  updateTransportReadout();
-  drawTimeline(true);
-};
-
-$("addNoteBtn").onclick = () => {
-  addNoteAt(
-    Number($("gridX").value),
-    Number($("gridY").value),
-    currentBeat()
-  );
-};
-
-$("deleteNoteBtn").onclick = deleteSelected;
-$("rotateNoteBtn").onclick = rotateSelected;
-$("duplicateNoteBtn").onclick = duplicateSelected;
-$("clearDifficultyBtn").onclick = clearCurrentDifficulty;
-$("copyDownBtn").onclick = copyFromLowerDifficulty;
-
-$("undoBtn").onclick = undo;
-$("redoBtn").onclick = redo;
-
-$("exportBtn").onclick = exportSongZip;
-$("saveProjectBtn").onclick = saveProject;
-
-$("loadProjectBtn").onclick = () => {
-  $("projectFile").click();
-};
-
-$("projectFile").addEventListener("change", event => {
-  const file = event.target.files?.[0];
-
-  if (file) {
-    loadProject(file).catch(error => {
-      setStatus(error.message, "error");
-    });
-  }
-
-  event.target.value = "";
-});
-
-$("metronomeBtn").onclick = toggleMetronome;
-
-$("zoom").oninput = event => {
-  timelineScale = Number(event.target.value);
-
-  $("zoomValue").textContent =
-    `${timelineScale} px/beat`;
-
-  drawTimeline(true);
-};
-
-document.querySelectorAll("#difficultyGrid button").forEach(button => {
-  button.addEventListener("click", () => {
-    switchDifficulty(button.dataset.difficulty);
-  });
-});
-
-$("bpm").addEventListener("change", () => {
-  updateTransportReadout();
-  drawTimeline(true);
-});
-
-$("songOffset").addEventListener("change", () => {
-  updateTransportReadout();
-  drawTimeline(true);
-});
-
-$("selectedBeatInput").addEventListener("change", event => {
-  const note = selectedNote();
-
-  if (!note) return;
-
-  updateNote(note.id, {
-    b: Number(
-      Math.max(0, Number(event.target.value) || 0).toFixed(4)
-    )
-  });
-});
-
-$("selectedAngleInput").addEventListener("change", event => {
-  const note = selectedNote();
-
-  if (!note) return;
-
-  updateNote(note.id, {
-    a: Math.max(
-      -180,
-      Math.min(180, Number(event.target.value) || 0)
-    )
-  });
-});
-
-$("noteColor").addEventListener("change", event => {
-  const note = selectedNote();
-
-  if (note) {
-    updateNote(note.id, {
-      c: Number(event.target.value)
-    });
-  }
-});
-
-$("noteDirection").addEventListener("change", event => {
-  const note = selectedNote();
-
-  if (note) {
-    updateNote(note.id, {
-      d: Number(event.target.value)
-    });
-  }
-});
-
-$("gridX").addEventListener("change", event => {
-  const note = selectedNote();
-
-  if (note) {
-    updateNote(note.id, {
-      x: Number(event.target.value)
-    });
-  }
-});
-
-$("gridY").addEventListener("change", event => {
-  const note = selectedNote();
-
-  if (note) {
-    updateNote(note.id, {
-      y: Number(event.target.value)
-    });
-  }
-});
-
-// ------------------------------------------------------------
-// Keyboard shortcuts
-// ------------------------------------------------------------
-
-window.addEventListener("keydown", event => {
-  const tag = document.activeElement?.tagName;
-
-  const typing =
-    tag === "INPUT" ||
-    tag === "SELECT" ||
-    tag === "TEXTAREA";
-
-  if (
-    (event.ctrlKey || event.metaKey) &&
-    event.key.toLowerCase() === "z"
-  ) {
-    event.preventDefault();
-    undo();
-    return;
-  }
-
-  if (
-    (event.ctrlKey || event.metaKey) &&
-    event.key.toLowerCase() === "y"
-  ) {
-    event.preventDefault();
-    redo();
-    return;
-  }
-
-  if (typing) return;
-
-  if (event.code === "Space") {
-    event.preventDefault();
-    togglePlayback();
-  } else if (
-    event.key === "Delete" ||
-    event.key === "Backspace"
-  ) {
-    deleteSelected();
-  } else if (event.key.toLowerCase() === "r") {
-    rotateSelected();
-  } else if (event.key.toLowerCase() === "d") {
-    duplicateSelected();
-  } else if (
-    event.key === "ArrowLeft" &&
-    selectedNote()
-  ) {
-    updateNote(selectedId, {
-      b: Math.max(
-        0,
-        selectedNote().b -
-          (Number($("snap").value) || 0.25)
-      )
-    });
-  } else if (
-    event.key === "ArrowRight" &&
-    selectedNote()
-  ) {
-    updateNote(selectedId, {
-      b: selectedNote().b +
-        (Number($("snap").value) || 0.25)
-    });
-  }
-});
-
-// ------------------------------------------------------------
-// Render loop and resize
-// ------------------------------------------------------------
-
-function resizeRenderer() {
-  const width = Math.max(1, viewport.clientWidth);
-  const height = Math.max(1, viewport.clientHeight);
-
-  camera.aspect = width / height;
-  camera.updateProjectionMatrix();
-
-  renderer.setSize(width, height, false);
-}
-
-window.addEventListener("resize", resizeRenderer);
-
-const resizeObserver = new ResizeObserver(resizeRenderer);
-resizeObserver.observe(viewport);
-
-resizeRenderer();
-
-renderer.setAnimationLoop(() => {
-  if (audioElement) {
-    if (audioElement.ended) {
-      $("playBtn").textContent = "▶ Play";
-      refreshVrControls();
-    }
-
-    updateTransportReadout();
-    updateMetronome();
-  }
-
-  updateVrBeatReadout();
-  updateEditorNoteVisibility();
-
-  if (vrDrag) {
-    updateControllerDrag();
-  }
-
-  pollControllerButtons();
-  updateIncomingPreview();
-  drawTimeline();
-
-  renderer.render(scene, camera);
-});
-
-// ------------------------------------------------------------
-// Initial UI state
-// ------------------------------------------------------------
-
-updateHistoryButtons();
-rebuildAllViews();
-updateTransportReadout();
-
-setStatus(
-  "Ready. Import audio, set BPM, then place notes at the playhead."
-);
+renderer.setAnimationLoop(animate);
+showEditor();
+$("loading").style.display="none";
+setStatus("Ready. Enter VR, import an OGG song, set BPM, and place notes.");
